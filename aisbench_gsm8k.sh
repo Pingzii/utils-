@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # 精度测试：
-# bash aisbench_vllm.sh accuracy /data/weights/Qwen3-32B Qwen 8000
+# bash aisbench_gsm8k.sh accuracy /data/weights/Qwen3-32B Qwen 8000
 #
 # 性能测试：
-# bash aisbench_vllm.sh perf /data/weights/Qwen3-32B Qwen 8000
+# bash aisbench_gsm8k.sh perf /data/weights/Qwen3-32B Qwen 8000
 
 MODE="${1:-}"
 MODEL_PATH="${2:-}"
@@ -51,7 +51,7 @@ import zipfile
 
 target = pathlib.Path(sys.argv[1])
 target.parent.mkdir(parents=True, exist_ok=True)
-url = "https://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip"
+url = "http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip"
 
 with tempfile.TemporaryDirectory() as temp_dir:
     archive = pathlib.Path(temp_dir) / "gsm8k.zip"
