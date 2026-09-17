@@ -1,6 +1,6 @@
 # AFD + DeepSeek-V4-Flash 性能测试：绿区执行手册
 
-本文档给绿区 Agent 使用。蓝区负责制定方案、分析结果和处理代码问题；绿区只按本手册执行命令、保存原始数据，并在失败时把证据返回蓝区。
+本文档给绿区 Agent 使用。蓝区负责制定方案、分析结果和处理代码问题；绿区只按本手册执行命令并在绿区本机保存原始数据。发生失败时，绿区 Agent 在绿区对话中输出错误摘要，由用户手动复制给蓝区 Agent；绿区不能直接向蓝区传文件。
 
 ## 1. 测试目标与固定口径
 
@@ -34,7 +34,7 @@ AISBench 如果同时输出多种吞吐量，必须全部保留：
 - Input token throughput（如果工具输出）
 - TTFT、TPOT、ITL 等时延指标（如果工具输出）
 
-不要在绿区自行猜测字段含义或手工换算。蓝区收到原始日志后再确定最终纵坐标。
+不要在绿区自行猜测字段含义或手工换算。用户把所需日志文本手动提供给蓝区后，再由蓝区确定最终纵坐标。
 
 ## 2. 严格执行原则
 
@@ -44,11 +44,12 @@ AISBench 如果同时输出多种吞吐量，必须全部保留：
 4. 每个 topology 先启动 FFN，再启动 Attention；只向 Attention 端口压测。
 5. 每个 topology 只启动一次服务，依次执行 2K 和 32K，保证两种上下文使用相同的服务参数。
 6. 每个上下文先 warm-up，再执行 3 次正式测量；warm-up 不计入结果。
-7. 任何一组失败都不得伪造、补齐或丢弃日志。停止当前阶段并按第 10 节回传。
+7. 任何一组失败都不得伪造、补齐或丢弃日志。停止当前阶段并按第 10 节在绿区对话中报告。
+8. 禁止从绿区执行 `git push`、`scp`、`curl` 上传或其他向蓝区传输文件的操作。所有产物只保存在绿区本机，跨区传递由用户按允许的方式手动完成。
 
 ## 3. 当前方案中的硬停止条件
 
-满足任意一项时停止压测，只返回检查结果：
+满足任意一项时停止压测，只在绿区对话中输出检查结果：
 
 - `npu-smi info` 看不到至少 8 张可用 NPU。`6A2F` 单机需要 8 张卡。
 - 模型不支持至少 `32768 + 128 = 32896` tokens 的输入加输出长度。
@@ -129,7 +130,7 @@ for key in (
 PY
 ```
 
-如果已知最大长度小于 `32896`，立即停止并回传。不要为了让 32K 跑起来而擅自修改模型 `config.json`。
+如果已知最大长度小于 `32896`，立即停止并在绿区对话中报告。不要为了让 32K 跑起来而擅自修改模型 `config.json`。
 
 ## 6. Phase 1：生成三组服务脚本
 
@@ -194,7 +195,7 @@ grep -nE 'DEVICES|RANKS|data-parallel|max-model-len|additional-config' \
     | tee "${PERF_ROOT}/env/generated_serve_parameters.txt"
 ```
 
-如果 `bash -n` 失败，停止并把脚本和错误返回蓝区。
+如果 `bash -n` 失败，停止并在绿区对话中打印脚本路径和错误；由用户手动把信息复制给蓝区。
 
 ## 7. Phase 2：逐个 topology 启动服务
 
@@ -264,7 +265,7 @@ ss -ltnp | grep -E ':(18000|18010|6239)\b' \
     | tee "${TOPO_ROOT}/service/ports_ready.txt" || true
 ```
 
-任一 topology 如果实际启动失败，直接执行失败回传，不进入 AISBench。
+任一 topology 如果实际启动失败，直接执行第 10 节的失败报告，不进入 AISBench。
 
 ## 8. Phase 3：AISBench warm-up 和正式测量
 
@@ -371,11 +372,11 @@ done
 npu-smi info | tee "${TOPO_ROOT}/service/npu_smi_after_stop.txt"
 ```
 
-如果 30 秒后进程仍未退出，记录 PID 和日志并返回蓝区，不要执行宽范围 `pkill`。
+如果 30 秒后进程仍未退出，记录 PID 和日志并在绿区对话中报告，不要执行宽范围 `pkill`。
 
-## 10. 失败时如何返回蓝区
+## 10. 失败时如何在绿区报告
 
-失败后不要尝试修改源码。返回以下信息：
+失败后不要尝试修改源码，也不要尝试向蓝区 push 或传文件。绿区 Agent 应在当前绿区对话中直接输出以下信息，用户再手动复制给蓝区 Agent：
 
 1. 失败阶段：环境检查、服务生成、FFN 启动、Attention 启动、2K warm-up、2K repeat N、32K warm-up 或 32K repeat N。
 2. topology、ISL、OSL、并发和请求数。
@@ -385,7 +386,7 @@ npu-smi info | tee "${TOPO_ROOT}/service/npu_smi_after_stop.txt"
 6. AISBench 日志最后 200 行（如果已经进入压测）。
 7. `npu-smi info` 和端口占用。
 
-可以生成回传包：
+如果用户后续需要完整文件，可以在绿区本机生成压缩包。这个命令只生成本地文件，不上传、不 push，也不会自动进入蓝区：
 
 ```bash
 tar -C "$(dirname "${PERF_ROOT}")" \
@@ -394,7 +395,9 @@ tar -C "$(dirname "${PERF_ROOT}")" \
 printf 'RESULT_ARCHIVE=%s.tar.gz\n' "${PERF_ROOT}"
 ```
 
-不得把 API Key、Claude settings、环境变量全集或其他凭据放进日志和压缩包。
+蓝区无法直接访问这里打印的绿区路径。路径只是方便用户在绿区查找文件；是否以及如何跨区取走文件，由用户按公司允许的流程手动处理。
+
+不得把 API Key、Claude settings、环境变量全集或其他凭据放进日志和压缩包。不得执行 `git add`、`git commit` 或 `git push` 提交测试产物。
 
 ## 11. 成功时交付内容
 
@@ -423,9 +426,9 @@ printf 'RESULT_ARCHIVE=%s.tar.gz\n' "${PERF_ROOT}"
 ```text
 阅读 afd_deepseek_v4_perf_green_runbook.md，并严格按文档执行。
 
-你的职责只是执行、完整保存日志和回传结果，不要修改 AFD、vLLM、vllm-ascend 源码，不要切换版本，不要自行调整测试参数，也不要隐瞒失败。
+你的职责只是执行、在绿区本机完整保存日志，并在当前绿区对话中报告结果。不要修改 AFD、vLLM、vllm-ascend 源码，不要切换版本，不要自行调整测试参数，也不要隐瞒失败。
 
-先执行 Phase 0 环境检查。若命中任何硬停止条件，立即停止并按第 10 节返回蓝区。检查通过后，按 2A2F、4A2F、6A2F 顺序执行。每个 topology 先 F 后 A，只向 Attention 的 18000 端口压测。每种上下文先 warm-up，再执行 3 次正式测量。
+先执行 Phase 0 环境检查。若命中任何硬停止条件，立即停止并按第 10 节在当前对话中输出报告。检查通过后，按 2A2F、4A2F、6A2F 顺序执行。每个 topology 先 F 后 A，只向 Attention 的 18000 端口压测。每种上下文先 warm-up，再执行 3 次正式测量。
 
-如果出现 NPU 错误、OOM、connector 错误、服务进程退出、API 不可用或 AISBench 非零退出，停止当前阶段，保留原始文件并返回 PERF_ROOT 和压缩包路径，不要擅自修复。
+如果出现 NPU 错误、OOM、connector 错误、服务进程退出、API 不可用或 AISBench 非零退出，停止当前阶段，在绿区保留原始文件，并在当前对话中打印错误摘要、日志最后 200 行和 PERF_ROOT。不要擅自修复，不要执行 git push、scp、curl 上传或其他跨区传输操作；用户会手动把必要文本提供给蓝区。
 ```
