@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 华为绿区（Linux arm64）Claude Code + inference-toolkit 一键部署脚本。
+#
+# 最小用法：
+#   bash deploy_green_zone_agent.sh \
+#     --api-key-file /secure/path/anthropic_api_key \
+#     --base-url https://your-api-endpoint
+#
+# 默认复用 create_container.sh 中的目录约定：
+#   绿区持久化目录：/home/s00988495
+#   proxy.sh：       /home/s00988495/proxy.sh
+#   离线安装脚本：   /home/s00988495/claude-offline-aarch64.sh
+#   AFD：            /home/s00988495/AFD
+#   inference-toolkit：/home/s00988495/inference-toolkit
+#
+# API Key 只从文件读取，不会打印，也不会出现在命令历史或进程参数中。
+
+SCRIPT_NAME="$(basename "$0")"
+DEFAULT_REPO_URL="https://szv-open.codehub.huawei.com/innersource/inference-toolkit_G/inference-toolkit.git"
+
+API_KEY_FILE=""
+BASE_URL=""
+PROXY_SCRIPT=""
+OFFLINE_INSTALLER=""
+CODEHUB_IP="141.2.250.30"
+GREEN_ZONE_HOME="${GREEN_ZONE_HOME:-/home/s00988495}"
+AFD_ROOT="${AFD_ROOT:-}"
+WORKSPACE_DIR=""
+REPO_URL="$DEFAULT_REPO_URL"
+REAL_ENV_FILE=""
+SIMULATION_ENV_FILE=""
+SETTINGS_PATH="${HOME}/.claude/settings.json"
+SKIP_HOSTS=0
+SKIP_TOOLKIT=0
+SKIP_VALIDATION=0
+UPDATE_TOOLKIT=0
+
+usage() {
+    cat <<EOF
+用法：
+  bash $SCRIPT_NAME [选项]
+
+必填：
+  --api-key-file PATH       保存 API Key 的文件路径（文件内容为纯 Key）
+  --base-url URL            灵枢 API 平台提供的 ANTHROPIC_BASE_URL
+
+可选：
+  --green-home PATH         Docker 挂载的绿区持久化目录
+                            默认：/home/s00988495
+  --afd-root PATH           AFD 根目录
+                            默认：<green-home>/AFD
+  --proxy-script PATH       绿区 proxy.sh 路径
+                            默认：<green-home>/proxy.sh
+  --offline-installer PATH  claude-offline-aarch64.sh 路径
+                            默认：<green-home>/claude-offline-aarch64.sh
+                            Node/Claude 已安装时无需存在
+  --workspace-dir PATH      inference-toolkit 目录
+                            默认：<green-home>/inference-toolkit
+  --repo-url URL            inference-toolkit Git 地址
+  --real-env-file PATH      用指定 YAML 覆盖生成的真机 env.yaml
+  --simulation-env-file PATH
+                            用指定 YAML 覆盖生成的仿真 env.yaml
+  --settings-path PATH      Claude settings.json 路径
+                            默认：$SETTINGS_PATH
+  --update-toolkit          已 clone 时执行 git pull --ff-only
+  --skip-hosts              不修改 /etc/hosts
+  --skip-toolkit            只装/配置 Claude，不部署 inference-toolkit
+  --skip-validation         不运行 validate_context.py
+  -h, --help                显示帮助
+
+示例：
+  bash $SCRIPT_NAME \
+    --api-key-file /home/s00988495/.secrets/claude.key \
+    --base-url https://example.internal/v1 \
+    --real-env-file /home/s00988495/real-machine-env.yaml
+
+说明：
+  1. API Key 文件建议执行：chmod 600 /path/to/key-file
+  2. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
+  3. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
+  4. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
+  5. 部署后运行 claude-green；需要跳过权限确认时显式运行：
+       claude-green --dangerous
+EOF
+}
+
+log() {
+    printf '[GreenAgent] %s\n' "$*"
+}
+
+warn() {
+    printf '[GreenAgent] 警告：%s\n' "$*" >&2
+}
+
+die() {
+    printf '[GreenAgent] 错误：%s\n' "$*" >&2
+    exit 1
+}
+
+need_value() {
+    [[ $# -ge 2 && -n "${2:-}" ]] || die "参数 $1 缺少值"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --api-key-file)
+            need_value "$@"
+            API_KEY_FILE="$2"
+            shift 2
+            ;;
+        --base-url)
+            need_value "$@"
+            BASE_URL="$2"
+            shift 2
+            ;;
+        --proxy-script)
+            need_value "$@"
+            PROXY_SCRIPT="$2"
+            shift 2
+            ;;
+        --offline-installer)
+            need_value "$@"
+            OFFLINE_INSTALLER="$2"
+            shift 2
+            ;;
+        --green-home)
+            need_value "$@"
+            GREEN_ZONE_HOME="$2"
+            shift 2
+            ;;
+        --afd-root)
+            need_value "$@"
+            AFD_ROOT="$2"
+            shift 2
+            ;;
+        --workspace-dir)
+            need_value "$@"
+            WORKSPACE_DIR="$2"
+            shift 2
+            ;;
+        --repo-url)
+            need_value "$@"
+            REPO_URL="$2"
+            shift 2
+            ;;
+        --real-env-file)
+            need_value "$@"
+            REAL_ENV_FILE="$2"
+            shift 2
+            ;;
+        --simulation-env-file)
+            need_value "$@"
+            SIMULATION_ENV_FILE="$2"
+            shift 2
+            ;;
+        --settings-path)
+            need_value "$@"
+            SETTINGS_PATH="$2"
+            shift 2
+            ;;
+        --update-toolkit)
+            UPDATE_TOOLKIT=1
+            shift
+            ;;
+        --skip-hosts)
+            SKIP_HOSTS=1
+            shift
+            ;;
+        --skip-toolkit)
+            SKIP_TOOLKIT=1
+            shift
+            ;;
+        --skip-validation)
+            SKIP_VALIDATION=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "未知参数：$1（运行 bash $SCRIPT_NAME --help 查看用法）"
+            ;;
+    esac
+done
+
+[[ -n "$API_KEY_FILE" ]] || die "必须提供 --api-key-file"
+[[ -n "$BASE_URL" ]] || die "必须提供 --base-url"
+command -v python3 >/dev/null 2>&1 || die "未找到 python3，inference-toolkit 初始化需要 Python 3"
+
+absolute_path() {
+    python3 -c \
+        'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' \
+        "$1"
+}
+
+# 对齐 create_container.sh 和 afd_build_all_sym.sh 的目录约定。
+GREEN_ZONE_HOME="$(absolute_path "$GREEN_ZONE_HOME")"
+[[ -n "$AFD_ROOT" ]] || AFD_ROOT="$GREEN_ZONE_HOME/AFD"
+[[ -n "$PROXY_SCRIPT" ]] || PROXY_SCRIPT="$GREEN_ZONE_HOME/proxy.sh"
+[[ -n "$OFFLINE_INSTALLER" ]] \
+    || OFFLINE_INSTALLER="$GREEN_ZONE_HOME/claude-offline-aarch64.sh"
+[[ -n "$WORKSPACE_DIR" ]] || WORKSPACE_DIR="$GREEN_ZONE_HOME/inference-toolkit"
+
+AFD_ROOT="$(absolute_path "$AFD_ROOT")"
+WORKSPACE_DIR="$(absolute_path "$WORKSPACE_DIR")"
+SETTINGS_PATH="$(absolute_path "$SETTINGS_PATH")"
+OFFLINE_INSTALLER="$(absolute_path "$OFFLINE_INSTALLER")"
+VLLM_REPO_DIR="$AFD_ROOT/vllm"
+VLLM_ASCEND_REPO_DIR="$AFD_ROOT/vllm-ascend"
+AFD_PLUGIN_REPO_DIR="$AFD_ROOT/afd-plugin"
+
+[[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || die "API Key 文件不可读：$API_KEY_FILE"
+[[ -f "$PROXY_SCRIPT" && -r "$PROXY_SCRIPT" ]] || die "代理脚本不可读：$PROXY_SCRIPT"
+[[ -z "$REAL_ENV_FILE" || -f "$REAL_ENV_FILE" ]] || die "真机 env 文件不存在：$REAL_ENV_FILE"
+[[ -z "$SIMULATION_ENV_FILE" || -f "$SIMULATION_ENV_FILE" ]] || die "仿真 env 文件不存在：$SIMULATION_ENV_FILE"
+[[ "$BASE_URL" =~ ^https?:// ]] || die "--base-url 必须以 http:// 或 https:// 开头"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    aarch64|arm64)
+        ;;
+    *)
+        die "本脚本面向 Linux arm64，当前架构为：$ARCH"
+        ;;
+esac
+
+# 先转成绝对路径，避免后续切换目录后相对路径失效。
+API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
+PROXY_SCRIPT="$(readlink -f "$PROXY_SCRIPT")"
+[[ -z "$REAL_ENV_FILE" ]] || REAL_ENV_FILE="$(readlink -f "$REAL_ENV_FILE")"
+[[ -z "$SIMULATION_ENV_FILE" ]] || SIMULATION_ENV_FILE="$(readlink -f "$SIMULATION_ENV_FILE")"
+
+export GREEN_ZONE_HOME AFD_ROOT
+export VLLM_REPO_DIR VLLM_ASCEND_REPO_DIR AFD_PLUGIN_REPO_DIR
+export INFERENCE_TOOLKIT_ROOT="$WORKSPACE_DIR"
+
+log "目录约定：GREEN_ZONE_HOME=$GREEN_ZONE_HOME"
+log "目录约定：AFD_ROOT=$AFD_ROOT"
+log "目录约定：INFERENCE_TOOLKIT_ROOT=$WORKSPACE_DIR"
+log "CodeHub 本地 IP：$CODEHUB_IP"
+
+KEY_MODE="$(stat -c '%a' "$API_KEY_FILE" 2>/dev/null || true)"
+if [[ -n "$KEY_MODE" && "$KEY_MODE" != "600" && "$KEY_MODE" != "400" ]]; then
+    warn "API Key 文件权限为 $KEY_MODE，建议执行：chmod 600 '$API_KEY_FILE'"
+fi
+
+source_proxy() {
+    # 某些历史 proxy.sh 在 nounset 模式下会失败，加载时暂时关闭。
+    set +u
+    # shellcheck disable=SC1090
+    source "$PROXY_SCRIPT"
+    set -u
+}
+
+export PATH="/opt/node22/bin:${HOME}/.local/bin:${PATH}"
+
+node_major=""
+if command -v node >/dev/null 2>&1; then
+    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+fi
+
+if [[ "$node_major" =~ ^[0-9]+$ ]] && (( node_major >= 22 )) \
+    && command -v claude >/dev/null 2>&1; then
+    log "Node.js v${node_major} 和 Claude Code 已安装，跳过离线安装"
+else
+    [[ -n "$OFFLINE_INSTALLER" ]] \
+        || die "Claude Code/Node.js v22 未就绪，请提供 --offline-installer"
+    [[ -f "$OFFLINE_INSTALLER" && -r "$OFFLINE_INSTALLER" ]] \
+        || die "离线安装脚本不可读：$OFFLINE_INSTALLER"
+    log "执行 Node.js + Claude Code 离线安装"
+    bash "$OFFLINE_INSTALLER" -y
+    export PATH="/opt/node22/bin:${PATH}"
+fi
+
+command -v node >/dev/null 2>&1 || die "安装后仍找不到 node"
+command -v claude >/dev/null 2>&1 || die "安装后仍找不到 claude"
+node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+[[ "$node_major" =~ ^[0-9]+$ ]] && (( node_major >= 22 )) \
+    || die "Node.js 版本必须 >= 22，当前为：$(node --version 2>/dev/null || echo unknown)"
+claude_version="$(claude --version 2>&1)"
+log "版本检查通过：Node $(node --version)，Claude ${claude_version%%$'\n'*}"
+
+log "合并 Claude settings（不会输出 API Key）"
+python3 - "$SETTINGS_PATH" "$API_KEY_FILE" "$BASE_URL" <<'PY'
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+import time
+
+settings_path = pathlib.Path(sys.argv[1])
+key_path = pathlib.Path(sys.argv[2])
+base_url = sys.argv[3]
+token = key_path.read_text(encoding="utf-8").strip()
+if not token:
+    raise SystemExit(f"API Key 文件为空：{key_path}")
+if "\n" in token or "\r" in token:
+    raise SystemExit("API Key 文件必须只包含一行 Key")
+
+settings_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+if settings_path.exists():
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"现有 settings.json 不是有效 JSON，已停止以免覆盖：{exc}")
+    if not isinstance(settings, dict):
+        raise SystemExit("现有 settings.json 顶层必须是 JSON object，已停止以免覆盖")
+    backup = settings_path.with_name(
+        f"{settings_path.name}.bak.{time.strftime('%Y%m%d%H%M%S')}.{os.getpid()}"
+    )
+    shutil.copy2(settings_path, backup)
+    os.chmod(backup, 0o600)
+else:
+    settings = {}
+
+env = settings.setdefault("env", {})
+if not isinstance(env, dict):
+    raise SystemExit('现有 settings.json 的 "env" 必须是 JSON object，已停止以免覆盖')
+env["ANTHROPIC_BASE_URL"] = base_url
+env["ANTHROPIC_AUTH_TOKEN"] = token
+
+fd, temp_name = tempfile.mkstemp(prefix=".settings.", suffix=".json", dir=settings_path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(settings, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(temp_name, 0o600)
+    os.replace(temp_name, settings_path)
+finally:
+    if os.path.exists(temp_name):
+        os.unlink(temp_name)
+PY
+
+log "写入持久化 PATH 配置"
+python3 - \
+    "${HOME}/.bashrc" \
+    "$GREEN_ZONE_HOME" \
+    "$AFD_ROOT" \
+    "$VLLM_REPO_DIR" \
+    "$VLLM_ASCEND_REPO_DIR" \
+    "$AFD_PLUGIN_REPO_DIR" \
+    "$WORKSPACE_DIR" <<'PY'
+import pathlib
+import shlex
+import sys
+
+path = pathlib.Path(sys.argv[1])
+green_home, afd_root, vllm_repo, vllm_ascend_repo, afd_plugin_repo, toolkit_root = (
+    shlex.quote(value) for value in sys.argv[2:]
+)
+begin = "# >>> green-zone-agent >>>"
+end = "# <<< green-zone-agent <<<"
+block = f'''{begin}
+export PATH="/opt/node22/bin:$HOME/.local/bin:$PATH"
+export GREEN_ZONE_HOME={green_home}
+export AFD_ROOT={afd_root}
+export VLLM_REPO_DIR={vllm_repo}
+export VLLM_ASCEND_REPO_DIR={vllm_ascend_repo}
+export AFD_PLUGIN_REPO_DIR={afd_plugin_repo}
+export INFERENCE_TOOLKIT_ROOT={toolkit_root}
+{end}'''
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+if begin in text and end in text:
+    before, rest = text.split(begin, 1)
+    _, after = rest.split(end, 1)
+    text = before.rstrip("\n") + "\n\n" + block + after
+else:
+    text = text.rstrip("\n") + "\n\n" + block + "\n"
+path.write_text(text, encoding="utf-8")
+PY
+
+if (( SKIP_HOSTS )); then
+    log "按参数跳过 /etc/hosts 配置"
+else
+    log "配置 /etc/hosts：$CODEHUB_IP szv-open.codehub.huawei.com（需要 root/sudo）"
+    HOSTS_RUNNER=(python3)
+    if [[ "${EUID}" -ne 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || die "修改 /etc/hosts 需要 root 或 sudo"
+        HOSTS_RUNNER=(sudo python3)
+    fi
+    "${HOSTS_RUNNER[@]}" - "$CODEHUB_IP" <<'PY'
+import os
+import pathlib
+import shutil
+import sys
+import time
+
+hosts_path = pathlib.Path("/etc/hosts")
+mapping = {
+    "computing.huawei.com": "141.3.1.75",
+    "szv-open.codehub.huawei.com": sys.argv[1],
+}
+original = hosts_path.read_text(encoding="utf-8")
+result = []
+managed_comment = "# Managed by deploy_green_zone_agent.sh"
+
+for raw_line in original.splitlines():
+    stripped = raw_line.strip()
+    if stripped == managed_comment:
+        continue
+    if not stripped or stripped.startswith("#"):
+        result.append(raw_line)
+        continue
+    data, marker, comment = raw_line.partition("#")
+    fields = data.split()
+    if len(fields) < 2:
+        result.append(raw_line)
+        continue
+    ip, aliases = fields[0], fields[1:]
+    kept = [name for name in aliases if name not in mapping]
+    if kept:
+        rebuilt = f"{ip} {' '.join(kept)}"
+        if marker:
+            rebuilt += f"  # {comment.strip()}"
+        result.append(rebuilt)
+
+result.append(managed_comment)
+for hostname, ip in mapping.items():
+    result.append(f"{ip} {hostname}")
+
+backup = hosts_path.with_name(
+    f"hosts.bak.green-agent.{time.strftime('%Y%m%d%H%M%S')}.{os.getpid()}"
+)
+shutil.copy2(hosts_path, backup)
+hosts_path.write_text("\n".join(result) + "\n", encoding="utf-8")
+print(f"[GreenAgent] /etc/hosts 备份：{backup}")
+PY
+fi
+
+log "生成安全启动入口：${HOME}/.local/bin/claude-green"
+mkdir -p "${HOME}/.local/bin"
+python3 - \
+    "${HOME}/.local/bin/claude-green" \
+    "$PROXY_SCRIPT" \
+    "$GREEN_ZONE_HOME" \
+    "$AFD_ROOT" \
+    "$VLLM_REPO_DIR" \
+    "$VLLM_ASCEND_REPO_DIR" \
+    "$AFD_PLUGIN_REPO_DIR" \
+    "$WORKSPACE_DIR" <<'PY'
+import os
+import pathlib
+import shlex
+import sys
+
+target = pathlib.Path(sys.argv[1])
+proxy_script = shlex.quote(sys.argv[2])
+green_home, afd_root, vllm_repo, vllm_ascend_repo, afd_plugin_repo, toolkit_root = (
+    shlex.quote(value) for value in sys.argv[3:]
+)
+content = f'''#!/usr/bin/env bash
+set -euo pipefail
+export PATH="/opt/node22/bin:$PATH"
+export GREEN_ZONE_HOME={green_home}
+export AFD_ROOT={afd_root}
+export VLLM_REPO_DIR={vllm_repo}
+export VLLM_ASCEND_REPO_DIR={vllm_ascend_repo}
+export AFD_PLUGIN_REPO_DIR={afd_plugin_repo}
+export INFERENCE_TOOLKIT_ROOT={toolkit_root}
+set +u
+# shellcheck disable=SC1090
+source {proxy_script}
+set -u
+
+if [[ "${{1:-}}" == "--dangerous" ]]; then
+    shift
+    exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 \\
+        claude --dangerously-skip-permissions "$@"
+fi
+
+exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 claude "$@"
+'''
+target.write_text(content, encoding="utf-8")
+os.chmod(target, 0o755)
+PY
+
+if (( SKIP_TOOLKIT )); then
+    log "按参数跳过 inference-toolkit 部署"
+else
+    source_proxy
+    if [[ -d "$WORKSPACE_DIR/.git" ]]; then
+        log "inference-toolkit 已存在：$WORKSPACE_DIR"
+        if (( UPDATE_TOOLKIT )); then
+            log "更新 inference-toolkit（git pull --ff-only）"
+            git -C "$WORKSPACE_DIR" pull --ff-only
+        fi
+    elif [[ -e "$WORKSPACE_DIR" ]]; then
+        die "工作目录已存在但不是 Git 仓库：$WORKSPACE_DIR"
+    else
+        log "clone inference-toolkit"
+        git clone "$REPO_URL" "$WORKSPACE_DIR"
+    fi
+
+    INIT_SCRIPT="$WORKSPACE_DIR/engineering-context/scripts/init_workspace.py"
+    VALIDATE_SCRIPT="$WORKSPACE_DIR/engineering-context/scripts/validate_context.py"
+    [[ -f "$INIT_SCRIPT" ]] || die "找不到 init_workspace.py：$INIT_SCRIPT"
+
+    REAL_ENV_TARGET="$WORKSPACE_DIR/validation/real-machine/env/env.yaml"
+    SIMULATION_ENV_TARGET="$WORKSPACE_DIR/validation/simulation/env/env.yaml"
+    if [[ ! -f "$REAL_ENV_TARGET" || ! -f "$SIMULATION_ENV_TARGET" ]]; then
+        log "初始化 inference-toolkit 工作区"
+        (
+            cd "$WORKSPACE_DIR"
+            python3 engineering-context/scripts/init_workspace.py --workspace .
+        )
+    else
+        log "工作区 env.yaml 已存在，跳过 init_workspace.py，避免覆盖本机配置"
+    fi
+
+    install_env_file() {
+        local source_file="$1"
+        local target_file="$2"
+        local label="$3"
+        local backup_file=""
+        mkdir -p "$(dirname "$target_file")"
+        if [[ -f "$target_file" ]]; then
+            backup_file="${target_file}.bak.$(date +%Y%m%d%H%M%S)"
+            cp -p "$target_file" "$backup_file"
+            log "$label env 原文件已备份：$backup_file"
+        fi
+        cp "$source_file" "$target_file"
+        log "$label env 已写入：$target_file"
+    }
+
+    if [[ -n "$REAL_ENV_FILE" ]]; then
+        install_env_file "$REAL_ENV_FILE" "$REAL_ENV_TARGET" "真机"
+    else
+        log "真机 env 请按本机填写：$REAL_ENV_TARGET"
+    fi
+    if [[ -n "$SIMULATION_ENV_FILE" ]]; then
+        install_env_file "$SIMULATION_ENV_FILE" "$SIMULATION_ENV_TARGET" "仿真"
+    else
+        log "仿真 env 请按本机填写：$SIMULATION_ENV_TARGET"
+    fi
+
+    log "链接 inference-toolkit skills 到 ~/.claude/skills"
+    mkdir -p "${HOME}/.claude/skills"
+    shopt -s nullglob
+    for skill_path in "$WORKSPACE_DIR"/skills/*; do
+        skill_name="$(basename "$skill_path")"
+        link_path="${HOME}/.claude/skills/${skill_name}"
+        if [[ -L "$link_path" || ! -e "$link_path" ]]; then
+            ln -sfn "$skill_path" "$link_path"
+        else
+            warn "skill 目标已存在且不是软链，保留原目录：$link_path"
+        fi
+    done
+    shopt -u nullglob
+
+    if (( SKIP_VALIDATION )); then
+        log "按参数跳过 validate_context.py"
+    else
+        [[ -f "$VALIDATE_SCRIPT" ]] || die "找不到 validate_context.py：$VALIDATE_SCRIPT"
+        log "运行 inference-toolkit 自检"
+        (
+            cd "$WORKSPACE_DIR"
+            python3 engineering-context/scripts/validate_context.py
+        )
+    fi
+fi
+
+cat <<EOF
+
+[GreenAgent] 部署完成。
+[GreenAgent] Claude settings：$SETTINGS_PATH
+[GreenAgent] 绿区持久化目录：$GREEN_ZONE_HOME
+[GreenAgent] AFD 根目录：$AFD_ROOT
+[GreenAgent] vLLM：$VLLM_REPO_DIR
+[GreenAgent] vLLM-Ascend：$VLLM_ASCEND_REPO_DIR
+[GreenAgent] AFD plugin：$AFD_PLUGIN_REPO_DIR
+[GreenAgent] CodeHub 本地 IP：$CODEHUB_IP
+[GreenAgent] 普通启动：claude-green
+[GreenAgent] 自动执行模式：claude-green --dangerous
+[GreenAgent] 注意：--dangerous 会跳过工具权限确认，只在可信目录中使用。
+EOF
+
+if (( ! SKIP_TOOLKIT )); then
+    printf '[GreenAgent] inference-toolkit：%s\n' "$WORKSPACE_DIR"
+fi
