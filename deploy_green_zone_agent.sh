@@ -4,8 +4,7 @@ set -euo pipefail
 # 华为绿区（Linux arm64）Claude Code + inference-toolkit 一键部署脚本。
 #
 # 最小用法：
-#   bash deploy_green_zone_agent.sh \
-#     --api-key-file /secure/path/anthropic_api_key
+#   bash deploy_green_zone_agent.sh
 #
 # 默认复用 create_container.sh 中的目录约定：
 #   绿区持久化目录：/home/s00988495
@@ -14,7 +13,8 @@ set -euo pipefail
 #   AFD：            /home/s00988495/AFD
 #   inference-toolkit：/home/s00988495/inference-toolkit
 #
-# API Key 只从文件读取，不会打印，也不会出现在命令历史或进程参数中。
+# 首次运行会静默读取 API Key，自动保存到持久化目录；不会打印 Key，
+# 也不会让 Key 出现在命令历史或进程参数中。
 
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_REPO_URL="https://szv-open.codehub.huawei.com/innersource/inference-toolkit_G/inference-toolkit.git"
@@ -35,14 +35,12 @@ SKIP_HOSTS=0
 SKIP_TOOLKIT=0
 SKIP_VALIDATION=0
 UPDATE_TOOLKIT=0
+REFRESH_API_KEY=0
 
 usage() {
     cat <<EOF
 用法：
   bash $SCRIPT_NAME [选项]
-
-必填：
-  --api-key-file PATH       保存 API Key 的文件路径（文件内容为纯 Key）
 
 可选：
   --base-url URL            自定义 ANTHROPIC_BASE_URL；不传则保留已有配置
@@ -64,18 +62,22 @@ usage() {
   --settings-path PATH      Claude settings.json 路径
                             默认：$SETTINGS_PATH
   --update-toolkit          已 clone 时执行 git pull --ff-only
+  --refresh-api-key         重新输入并覆盖已保存的 API Key
   --skip-hosts              不修改 /etc/hosts
   --skip-toolkit            只装/配置 Claude，不部署 inference-toolkit
   --skip-validation         不运行 validate_context.py
   -h, --help                显示帮助
 
 示例：
-  bash $SCRIPT_NAME \
-    --api-key-file /home/s00988495/.secrets/claude.key \
-    --real-env-file /home/s00988495/real-machine-env.yaml
+  bash $SCRIPT_NAME
+
+  # 更换 API Key
+  bash $SCRIPT_NAME --refresh-api-key
 
 说明：
-  1. API Key 文件建议执行：chmod 600 /path/to/key-file
+  1. 首次运行会静默提示输入 API Key，并自动保存为：
+       <green-home>/.secrets/claude.key
+     后续运行默认复用；文件权限自动设置为 600。
   2. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
   3. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
   4. 只有灵枢明确提供自定义网关时，才需要传 --base-url。
@@ -104,11 +106,6 @@ need_value() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --api-key-file)
-            need_value "$@"
-            API_KEY_FILE="$2"
-            shift 2
-            ;;
         --base-url)
             need_value "$@"
             BASE_URL="$2"
@@ -163,6 +160,10 @@ while [[ $# -gt 0 ]]; do
             UPDATE_TOOLKIT=1
             shift
             ;;
+        --refresh-api-key)
+            REFRESH_API_KEY=1
+            shift
+            ;;
         --skip-hosts)
             SKIP_HOSTS=1
             shift
@@ -185,7 +186,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$API_KEY_FILE" ]] || die "必须提供 --api-key-file"
 command -v python3 >/dev/null 2>&1 || die "未找到 python3，inference-toolkit 初始化需要 Python 3"
 
 absolute_path() {
@@ -206,11 +206,11 @@ AFD_ROOT="$(absolute_path "$AFD_ROOT")"
 WORKSPACE_DIR="$(absolute_path "$WORKSPACE_DIR")"
 SETTINGS_PATH="$(absolute_path "$SETTINGS_PATH")"
 OFFLINE_INSTALLER="$(absolute_path "$OFFLINE_INSTALLER")"
+API_KEY_FILE="$GREEN_ZONE_HOME/.secrets/claude.key"
 VLLM_REPO_DIR="$AFD_ROOT/vllm"
 VLLM_ASCEND_REPO_DIR="$AFD_ROOT/vllm-ascend"
 AFD_PLUGIN_REPO_DIR="$AFD_ROOT/afd-plugin"
 
-[[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || die "API Key 文件不可读：$API_KEY_FILE"
 [[ -f "$PROXY_SCRIPT" && -r "$PROXY_SCRIPT" ]] || die "代理脚本不可读：$PROXY_SCRIPT"
 [[ -z "$REAL_ENV_FILE" || -f "$REAL_ENV_FILE" ]] || die "真机 env 文件不存在：$REAL_ENV_FILE"
 [[ -z "$SIMULATION_ENV_FILE" || -f "$SIMULATION_ENV_FILE" ]] || die "仿真 env 文件不存在：$SIMULATION_ENV_FILE"
@@ -228,7 +228,6 @@ case "$ARCH" in
 esac
 
 # 先转成绝对路径，避免后续切换目录后相对路径失效。
-API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
 PROXY_SCRIPT="$(readlink -f "$PROXY_SCRIPT")"
 [[ -z "$REAL_ENV_FILE" ]] || REAL_ENV_FILE="$(readlink -f "$REAL_ENV_FILE")"
 [[ -z "$SIMULATION_ENV_FILE" ]] || SIMULATION_ENV_FILE="$(readlink -f "$SIMULATION_ENV_FILE")"
@@ -241,6 +240,31 @@ log "目录约定：GREEN_ZONE_HOME=$GREEN_ZONE_HOME"
 log "目录约定：AFD_ROOT=$AFD_ROOT"
 log "目录约定：INFERENCE_TOOLKIT_ROOT=$WORKSPACE_DIR"
 log "CodeHub 本地 IP：$CODEHUB_IP"
+
+if [[ ! -s "$API_KEY_FILE" ]] || (( REFRESH_API_KEY )); then
+    if [[ ! -t 0 ]]; then
+        die "当前不是交互式终端，无法安全输入 API Key"
+    fi
+    mkdir -p "$(dirname "$API_KEY_FILE")"
+    chmod 700 "$(dirname "$API_KEY_FILE")"
+    API_KEY=""
+    if ! IFS= read -r -s -p "请输入 API Key: " API_KEY; then
+        printf '\n' >&2
+        die "读取 API Key 失败"
+    fi
+    printf '\n'
+    [[ -n "$API_KEY" ]] || die "API Key 不能为空"
+    old_umask="$(umask)"
+    umask 077
+    printf '%s\n' "$API_KEY" > "$API_KEY_FILE"
+    umask "$old_umask"
+    unset API_KEY
+    chmod 600 "$API_KEY_FILE"
+    log "API Key 已安全保存：$API_KEY_FILE"
+else
+    chmod 600 "$API_KEY_FILE"
+    log "API Key 文件已存在，直接复用：$API_KEY_FILE"
+fi
 
 KEY_MODE="$(stat -c '%a' "$API_KEY_FILE" 2>/dev/null || true)"
 if [[ -n "$KEY_MODE" && "$KEY_MODE" != "600" && "$KEY_MODE" != "400" ]]; then
@@ -574,6 +598,7 @@ cat <<EOF
 
 [GreenAgent] 部署完成。
 [GreenAgent] Claude settings：$SETTINGS_PATH
+[GreenAgent] API Key 文件：$API_KEY_FILE
 [GreenAgent] 绿区持久化目录：$GREEN_ZONE_HOME
 [GreenAgent] AFD 根目录：$AFD_ROOT
 [GreenAgent] vLLM：$VLLM_REPO_DIR
