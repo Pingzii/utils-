@@ -5,8 +5,7 @@ set -euo pipefail
 #
 # 最小用法：
 #   bash deploy_green_zone_agent.sh \
-#     --api-key-file /secure/path/anthropic_api_key \
-#     --base-url https://your-api-endpoint
+#     --api-key-file /secure/path/anthropic_api_key
 #
 # 默认复用 create_container.sh 中的目录约定：
 #   绿区持久化目录：/home/s00988495
@@ -44,9 +43,9 @@ usage() {
 
 必填：
   --api-key-file PATH       保存 API Key 的文件路径（文件内容为纯 Key）
-  --base-url URL            灵枢 API 平台提供的 ANTHROPIC_BASE_URL
 
 可选：
+  --base-url URL            自定义 ANTHROPIC_BASE_URL；不传则保留已有配置
   --green-home PATH         Docker 挂载的绿区持久化目录
                             默认：/home/s00988495
   --afd-root PATH           AFD 根目录
@@ -73,15 +72,15 @@ usage() {
 示例：
   bash $SCRIPT_NAME \
     --api-key-file /home/s00988495/.secrets/claude.key \
-    --base-url https://example.internal/v1 \
     --real-env-file /home/s00988495/real-machine-env.yaml
 
 说明：
   1. API Key 文件建议执行：chmod 600 /path/to/key-file
   2. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
   3. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
-  4. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
-  5. 部署后运行 claude-green；需要跳过权限确认时显式运行：
+  4. 只有灵枢明确提供自定义网关时，才需要传 --base-url。
+  5. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
+  6. 部署后运行 claude-green；需要跳过权限确认时显式运行：
        claude-green --dangerous
 EOF
 }
@@ -187,7 +186,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$API_KEY_FILE" ]] || die "必须提供 --api-key-file"
-[[ -n "$BASE_URL" ]] || die "必须提供 --base-url"
 command -v python3 >/dev/null 2>&1 || die "未找到 python3，inference-toolkit 初始化需要 Python 3"
 
 absolute_path() {
@@ -216,7 +214,9 @@ AFD_PLUGIN_REPO_DIR="$AFD_ROOT/afd-plugin"
 [[ -f "$PROXY_SCRIPT" && -r "$PROXY_SCRIPT" ]] || die "代理脚本不可读：$PROXY_SCRIPT"
 [[ -z "$REAL_ENV_FILE" || -f "$REAL_ENV_FILE" ]] || die "真机 env 文件不存在：$REAL_ENV_FILE"
 [[ -z "$SIMULATION_ENV_FILE" || -f "$SIMULATION_ENV_FILE" ]] || die "仿真 env 文件不存在：$SIMULATION_ENV_FILE"
-[[ "$BASE_URL" =~ ^https?:// ]] || die "--base-url 必须以 http:// 或 https:// 开头"
+if [[ -n "$BASE_URL" ]] && [[ ! "$BASE_URL" =~ ^https?:// ]]; then
+    die "--base-url 必须以 http:// 或 https:// 开头"
+fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -283,7 +283,11 @@ node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
 claude_version="$(claude --version 2>&1)"
 log "版本检查通过：Node $(node --version)，Claude ${claude_version%%$'\n'*}"
 
-log "合并 Claude settings（不会输出 API Key）"
+if [[ -n "$BASE_URL" ]]; then
+    log "合并 Claude settings，并配置自定义 ANTHROPIC_BASE_URL（不会输出 API Key）"
+else
+    log "合并 Claude settings；未传 --base-url，保留已有 Base URL 配置（不会输出 API Key）"
+fi
 python3 - "$SETTINGS_PATH" "$API_KEY_FILE" "$BASE_URL" <<'PY'
 import json
 import os
@@ -295,7 +299,7 @@ import time
 
 settings_path = pathlib.Path(sys.argv[1])
 key_path = pathlib.Path(sys.argv[2])
-base_url = sys.argv[3]
+base_url = sys.argv[3].strip()
 token = key_path.read_text(encoding="utf-8").strip()
 if not token:
     raise SystemExit(f"API Key 文件为空：{key_path}")
@@ -322,7 +326,8 @@ else:
 env = settings.setdefault("env", {})
 if not isinstance(env, dict):
     raise SystemExit('现有 settings.json 的 "env" 必须是 JSON object，已停止以免覆盖')
-env["ANTHROPIC_BASE_URL"] = base_url
+if base_url:
+    env["ANTHROPIC_BASE_URL"] = base_url
 env["ANTHROPIC_AUTH_TOKEN"] = token
 
 fd, temp_name = tempfile.mkstemp(prefix=".settings.", suffix=".json", dir=settings_path.parent)
