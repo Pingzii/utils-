@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_REPO_URL="https://szv-open.codehub.huawei.com/innersource/inference-toolkit_G/inference-toolkit.git"
+OFFLINE_INSTALLER_SOURCE="root@141.61.92.13:/home/w00984239/claude-offline-aarch64.sh"
 
 API_KEY_FILE=""
 BASE_URL=""
@@ -50,9 +51,6 @@ usage() {
                             默认：<green-home>/AFD
   --proxy-script PATH       绿区 proxy.sh 路径
                             默认：<green-home>/proxy.sh
-  --offline-installer PATH  claude-offline-aarch64.sh 路径
-                            默认：<green-home>/claude-offline-aarch64.sh
-                            Node/Claude 已安装时无需存在
   --workspace-dir PATH      inference-toolkit 目录
                             默认：<green-home>/inference-toolkit
   --repo-url URL            inference-toolkit Git 地址
@@ -75,14 +73,18 @@ usage() {
   bash $SCRIPT_NAME --refresh-api-key
 
 说明：
-  1. 首次运行会静默提示输入 API Key，并自动保存为：
+  1. 本地已有非空 claude-offline-aarch64.sh 时直接复用；缺失时通过
+     scp 获取：
+       $OFFLINE_INSTALLER_SOURCE
+     scp 失败时立即停止，不继续安装。
+  2. 首次运行会静默提示输入 API Key，并自动保存为：
        <green-home>/.secrets/claude.key
      后续运行默认复用；文件权限自动设置为 600。
-  2. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
-  3. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
-  4. 只有灵枢明确提供自定义网关时，才需要传 --base-url。
-  5. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
-  6. 部署后运行 claude-green；需要跳过权限确认时显式运行：
+  3. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
+  4. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
+  5. 只有灵枢明确提供自定义网关时，才需要传 --base-url。
+  6. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
+  7. 部署后运行 claude-green；需要跳过权限确认时显式运行：
        claude-green --dangerous
 EOF
 }
@@ -114,11 +116,6 @@ while [[ $# -gt 0 ]]; do
         --proxy-script)
             need_value "$@"
             PROXY_SCRIPT="$2"
-            shift 2
-            ;;
-        --offline-installer)
-            need_value "$@"
-            OFFLINE_INSTALLER="$2"
             shift 2
             ;;
         --green-home)
@@ -198,8 +195,7 @@ absolute_path() {
 GREEN_ZONE_HOME="$(absolute_path "$GREEN_ZONE_HOME")"
 [[ -n "$AFD_ROOT" ]] || AFD_ROOT="$GREEN_ZONE_HOME/AFD"
 [[ -n "$PROXY_SCRIPT" ]] || PROXY_SCRIPT="$GREEN_ZONE_HOME/proxy.sh"
-[[ -n "$OFFLINE_INSTALLER" ]] \
-    || OFFLINE_INSTALLER="$GREEN_ZONE_HOME/claude-offline-aarch64.sh"
+OFFLINE_INSTALLER="$GREEN_ZONE_HOME/claude-offline-aarch64.sh"
 [[ -n "$WORKSPACE_DIR" ]] || WORKSPACE_DIR="$GREEN_ZONE_HOME/inference-toolkit"
 
 AFD_ROOT="$(absolute_path "$AFD_ROOT")"
@@ -241,6 +237,32 @@ log "目录约定：AFD_ROOT=$AFD_ROOT"
 log "目录约定：INFERENCE_TOOLKIT_ROOT=$WORKSPACE_DIR"
 log "CodeHub 本地 IP：$CODEHUB_IP"
 
+mkdir -p "$GREEN_ZONE_HOME"
+if [[ -s "$OFFLINE_INSTALLER" && -r "$OFFLINE_INSTALLER" ]]; then
+    log "Claude 离线安装包已存在，跳过 scp：$OFFLINE_INSTALLER"
+else
+    command -v scp >/dev/null 2>&1 || die "未找到 scp，无法获取 Claude 离线安装包"
+    log "本地没有可用离线安装包，通过 scp 获取"
+    log "离线安装包来源：$OFFLINE_INSTALLER_SOURCE"
+    log "离线安装包目标：$OFFLINE_INSTALLER"
+    if ! (
+        cd "$GREEN_ZONE_HOME"
+        scp -r "$OFFLINE_INSTALLER_SOURCE" ./
+    ); then
+        die "scp 离线安装包失败，停止安装"
+    fi
+    [[ -s "$OFFLINE_INSTALLER" && -r "$OFFLINE_INSTALLER" ]] \
+        || die "scp 返回成功，但离线安装包不存在或为空：$OFFLINE_INSTALLER"
+    log "Claude 离线安装包复制成功"
+fi
+chmod 700 "$OFFLINE_INSTALLER"
+
+export PATH="/opt/node22/bin:${HOME}/.local/bin:${PATH}"
+node_major=""
+if command -v node >/dev/null 2>&1; then
+    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+fi
+
 if [[ ! -s "$API_KEY_FILE" ]] || (( REFRESH_API_KEY )); then
     if [[ ! -t 0 ]]; then
         die "当前不是交互式终端，无法安全输入 API Key"
@@ -279,20 +301,11 @@ source_proxy() {
     set -u
 }
 
-export PATH="/opt/node22/bin:${HOME}/.local/bin:${PATH}"
-
-node_major=""
-if command -v node >/dev/null 2>&1; then
-    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
-fi
-
 if [[ "$node_major" =~ ^[0-9]+$ ]] && (( node_major >= 22 )) \
     && command -v claude >/dev/null 2>&1; then
     log "Node.js v${node_major} 和 Claude Code 已安装，跳过离线安装"
 else
-    [[ -n "$OFFLINE_INSTALLER" ]] \
-        || die "Claude Code/Node.js v22 未就绪，请提供 --offline-installer"
-    [[ -f "$OFFLINE_INSTALLER" && -r "$OFFLINE_INSTALLER" ]] \
+    [[ -s "$OFFLINE_INSTALLER" && -r "$OFFLINE_INSTALLER" ]] \
         || die "离线安装脚本不可读：$OFFLINE_INSTALLER"
     log "执行 Node.js + Claude Code 离线安装"
     bash "$OFFLINE_INSTALLER" -y
@@ -306,6 +319,29 @@ node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
     || die "Node.js 版本必须 >= 22，当前为：$(node --version 2>/dev/null || echo unknown)"
 claude_version="$(claude --version 2>&1)"
 log "版本检查通过：Node $(node --version)，Claude ${claude_version%%$'\n'*}"
+
+expose_command() {
+    local command_name="$1"
+    local source_path="$2"
+    local target_path="/usr/local/bin/$command_name"
+
+    [[ -x "$source_path" ]] || die "命令不可执行：$source_path"
+    mkdir -p /usr/local/bin
+    if [[ "$source_path" == "$target_path" ]]; then
+        return
+    elif [[ -L "$target_path" ]]; then
+        ln -sfn "$source_path" "$target_path"
+    elif [[ -e "$target_path" ]]; then
+        warn "保留已有命令，不覆盖：$target_path"
+        return
+    else
+        ln -s "$source_path" "$target_path"
+    fi
+    log "命令已加入当前 Shell 可见路径：$target_path -> $source_path"
+}
+
+expose_command node "$(command -v node)"
+expose_command claude "$(command -v claude)"
 
 if [[ -n "$BASE_URL" ]]; then
     log "合并 Claude settings，并配置自定义 ANTHROPIC_BASE_URL（不会输出 API Key）"
@@ -508,6 +544,7 @@ exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 claude "$@"
 target.write_text(content, encoding="utf-8")
 os.chmod(target, 0o755)
 PY
+expose_command claude-green "${HOME}/.local/bin/claude-green"
 
 if (( SKIP_TOOLKIT )); then
     log "按参数跳过 inference-toolkit 部署"
@@ -519,8 +556,17 @@ else
             log "更新 inference-toolkit（git pull --ff-only）"
             git -C "$WORKSPACE_DIR" pull --ff-only
         fi
-    elif [[ -e "$WORKSPACE_DIR" ]]; then
-        die "工作目录已存在但不是 Git 仓库：$WORKSPACE_DIR"
+    elif [[ -e "$WORKSPACE_DIR" || -L "$WORKSPACE_DIR" ]]; then
+        TOOLKIT_TIMESTAMP="$(date +%Y%m%d%H%M%S).$$"
+        TOOLKIT_BACKUP="${WORKSPACE_DIR}.bak.${TOOLKIT_TIMESTAMP}"
+        TOOLKIT_CLONE="${WORKSPACE_DIR}.clone.${TOOLKIT_TIMESTAMP}"
+        warn "工作目录已存在但不是 Git 仓库，将先 clone 新仓库并备份旧目录"
+        log "临时 clone 目录：$TOOLKIT_CLONE"
+        git clone "$REPO_URL" "$TOOLKIT_CLONE"
+        mv "$WORKSPACE_DIR" "$TOOLKIT_BACKUP"
+        mv "$TOOLKIT_CLONE" "$WORKSPACE_DIR"
+        log "旧 inference-toolkit 已完整备份：$TOOLKIT_BACKUP"
+        log "新 inference-toolkit 已就绪：$WORKSPACE_DIR"
     else
         log "clone inference-toolkit"
         git clone "$REPO_URL" "$WORKSPACE_DIR"
