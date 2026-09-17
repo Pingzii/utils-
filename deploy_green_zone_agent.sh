@@ -94,8 +94,8 @@ usage() {
   8. inference-toolkit 支持 Git clone、已解压目录，以及放在 <green-home>
      下的 inference-toolkit-master.tar.gz；检测到 tar 包时自动解压安装。
      clone 失败时会打印 tar 包下载、上传和解压指引。
-  9. 部署后运行 claude-green；需要跳过权限确认时显式运行：
-       claude-green --dangerous
+  9. 部署后直接运行 claude；需要跳过权限确认时显式运行：
+       claude --dangerous
 EOF
 }
 
@@ -354,8 +354,8 @@ expose_command() {
     log "命令已加入当前 Shell 可见路径：$target_path -> $source_path"
 }
 
+CLAUDE_BINARY="$(command -v claude)"
 expose_command node "$(command -v node)"
-expose_command claude "$(command -v claude)"
 
 if [[ -n "$BASE_URL" ]]; then
     log "合并 Claude settings，并配置自定义 ANTHROPIC_BASE_URL（不会输出 API Key）"
@@ -476,7 +476,7 @@ green_home, afd_root, vllm_repo, vllm_ascend_repo, afd_plugin_repo, toolkit_root
 begin = "# >>> green-zone-agent >>>"
 end = "# <<< green-zone-agent <<<"
 block = f'''{begin}
-export PATH="/opt/node22/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:/opt/node22/bin:$PATH"
 export GREEN_ZONE_HOME={green_home}
 export AFD_ROOT={afd_root}
 export VLLM_REPO_DIR={vllm_repo}
@@ -552,10 +552,11 @@ print(f"[GreenAgent] /etc/hosts 备份：{backup}")
 PY
 fi
 
-log "生成安全启动入口：${HOME}/.local/bin/claude-green"
+log "生成统一 Claude 启动入口：${HOME}/.local/bin/claude"
 mkdir -p "${HOME}/.local/bin"
 python3 - \
-    "${HOME}/.local/bin/claude-green" \
+    "${HOME}/.local/bin/claude" \
+    "$CLAUDE_BINARY" \
     "$PROXY_SCRIPT" \
     "$GREEN_ZONE_HOME" \
     "$AFD_ROOT" \
@@ -569,9 +570,10 @@ import shlex
 import sys
 
 target = pathlib.Path(sys.argv[1])
-proxy_script = shlex.quote(sys.argv[2])
+claude_binary = shlex.quote(sys.argv[2])
+proxy_script = shlex.quote(sys.argv[3])
 green_home, afd_root, vllm_repo, vllm_ascend_repo, afd_plugin_repo, toolkit_root = (
-    shlex.quote(value) for value in sys.argv[3:]
+    shlex.quote(value) for value in sys.argv[4:]
 )
 content = f'''#!/usr/bin/env bash
 set -euo pipefail
@@ -590,15 +592,15 @@ set -u
 if [[ "${{1:-}}" == "--dangerous" ]]; then
     shift
     exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 \\
-        claude --dangerously-skip-permissions "$@"
+        {claude_binary} --dangerously-skip-permissions "$@"
 fi
 
-exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 claude "$@"
+exec env NODE_TLS_REJECT_UNAUTHORIZED=0 IS_SANDBOX=1 {claude_binary} "$@"
 '''
 target.write_text(content, encoding="utf-8")
 os.chmod(target, 0o755)
 PY
-expose_command claude-green "${HOME}/.local/bin/claude-green"
+expose_command claude "${HOME}/.local/bin/claude"
 
 toolkit_is_ready() {
     local toolkit_dir="$1"
@@ -832,8 +834,8 @@ cat <<EOF
 [GreenAgent] vLLM-Ascend：$VLLM_ASCEND_REPO_DIR
 [GreenAgent] AFD plugin：$AFD_PLUGIN_REPO_DIR
 [GreenAgent] CodeHub 本地 IP：$CODEHUB_IP
-[GreenAgent] 普通启动：claude-green
-[GreenAgent] 自动执行模式：claude-green --dangerous
+[GreenAgent] 普通启动：claude
+[GreenAgent] 自动执行模式：claude --dangerous
 [GreenAgent] 注意：--dangerous 会跳过工具权限确认，只在可信目录中使用。
 EOF
 
