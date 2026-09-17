@@ -29,6 +29,8 @@ CODEHUB_IP="141.2.250.30"
 GREEN_ZONE_HOME="${GREEN_ZONE_HOME:-/home/s00988495}"
 AFD_ROOT="${AFD_ROOT:-}"
 WORKSPACE_DIR=""
+TOOLKIT_ARCHIVE=""
+TOOLKIT_EXTRACTED_DIR=""
 REPO_URL="$DEFAULT_REPO_URL"
 REAL_ENV_FILE=""
 SIMULATION_ENV_FILE=""
@@ -89,8 +91,9 @@ usage() {
      GLM-5.2 默认值，
      已经改成其他模型的配置保持不变。
   7. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
-  8. inference-toolkit 支持 Git clone 或手动解压目录；clone 失败时会打印
-     tar 包下载、上传和解压指引。
+  8. inference-toolkit 支持 Git clone、已解压目录，以及放在 <green-home>
+     下的 inference-toolkit-master.tar.gz；检测到 tar 包时自动解压安装。
+     clone 失败时会打印 tar 包下载、上传和解压指引。
   9. 部署后运行 claude-green；需要跳过权限确认时显式运行：
        claude-green --dangerous
 EOF
@@ -204,9 +207,13 @@ GREEN_ZONE_HOME="$(absolute_path "$GREEN_ZONE_HOME")"
 [[ -n "$PROXY_SCRIPT" ]] || PROXY_SCRIPT="$GREEN_ZONE_HOME/proxy.sh"
 OFFLINE_INSTALLER="$GREEN_ZONE_HOME/claude-offline-aarch64.sh"
 [[ -n "$WORKSPACE_DIR" ]] || WORKSPACE_DIR="$GREEN_ZONE_HOME/inference-toolkit"
+TOOLKIT_ARCHIVE="$GREEN_ZONE_HOME/inference-toolkit-master.tar.gz"
+TOOLKIT_EXTRACTED_DIR="$GREEN_ZONE_HOME/inference-toolkit-master"
 
 AFD_ROOT="$(absolute_path "$AFD_ROOT")"
 WORKSPACE_DIR="$(absolute_path "$WORKSPACE_DIR")"
+TOOLKIT_ARCHIVE="$(absolute_path "$TOOLKIT_ARCHIVE")"
+TOOLKIT_EXTRACTED_DIR="$(absolute_path "$TOOLKIT_EXTRACTED_DIR")"
 SETTINGS_PATH="$(absolute_path "$SETTINGS_PATH")"
 OFFLINE_INSTALLER="$(absolute_path "$OFFLINE_INSTALLER")"
 API_KEY_FILE="$GREEN_ZONE_HOME/.secrets/claude.key"
@@ -608,14 +615,16 @@ print_toolkit_manual_install_help() {
   1. 在可以访问 CodeHub 的浏览器中打开：
      $REPO_URL
 
-  2. 下载仓库 tar 包，并上传到：
-     $GREEN_ZONE_HOME
+  2. 下载仓库 tar 包，并以这个文件名上传：
+     $TOOLKIT_ARCHIVE
 
-  3. 在绿区机器上解压 tar 包：
-     cd $GREEN_ZONE_HOME
-     tar -xf <实际下载的 tar 包文件名>
+  3. 重新运行本脚本。脚本会自动执行校验和解压。
 
-  4. 确保解压后的最终目录名为：
+     如果希望手动解压，也可以运行：
+       cd $GREEN_ZONE_HOME
+       tar -xf inference-toolkit-master.tar.gz
+
+  4. 手动解压时，确保解压后的最终目录名为：
      $WORKSPACE_DIR
 
      如果这个目录已存在但内容不完整，请先自行改名备份，再把解压出来的
@@ -631,6 +640,73 @@ print_toolkit_manual_install_help() {
 EOF
 }
 
+backup_existing_toolkit() {
+    local reason="$1"
+    if [[ -e "$WORKSPACE_DIR" || -L "$WORKSPACE_DIR" ]]; then
+        local timestamp backup_path
+        timestamp="$(date +%Y%m%d%H%M%S).$$"
+        backup_path="${WORKSPACE_DIR}.bak.${reason}.${timestamp}"
+        mv "$WORKSPACE_DIR" "$backup_path"
+        log "旧 inference-toolkit 已完整备份：$backup_path"
+    fi
+}
+
+adopt_extracted_toolkit() {
+    local source_dir="$1"
+    local source_label="$2"
+    toolkit_is_ready "$source_dir" \
+        || die "$source_label 内容不完整：$source_dir"
+    backup_existing_toolkit "manual"
+    mv "$source_dir" "$WORKSPACE_DIR"
+    log "$source_label 已安装为：$WORKSPACE_DIR"
+}
+
+install_toolkit_from_archive() {
+    local archive_path="$1"
+    local archive_listing timestamp staging_dir candidate_dir=""
+
+    command -v tar >/dev/null 2>&1 || die "检测到 toolkit tar 包，但系统没有 tar 命令"
+    if ! archive_listing="$(tar -tf "$archive_path")"; then
+        die "无法读取 toolkit tar 包：$archive_path"
+    fi
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' <<<"$archive_listing"; then
+        die "toolkit tar 包包含不安全路径，拒绝解压：$archive_path"
+    fi
+
+    timestamp="$(date +%Y%m%d%H%M%S).$$"
+    staging_dir="${WORKSPACE_DIR}.extract.${timestamp}"
+    mkdir -p "$staging_dir"
+    log "解压 inference-toolkit：$archive_path"
+    if ! tar -xf "$archive_path" -C "$staging_dir"; then
+        die "inference-toolkit tar 包解压失败：$archive_path"
+    fi
+
+    if toolkit_is_ready "$staging_dir"; then
+        candidate_dir="$staging_dir"
+    else
+        while IFS= read -r -d '' extracted_dir; do
+            if toolkit_is_ready "$extracted_dir"; then
+                candidate_dir="$extracted_dir"
+                break
+            fi
+        done < <(find "$staging_dir" -mindepth 1 -maxdepth 1 -type d -print0)
+    fi
+
+    if [[ -z "$candidate_dir" ]]; then
+        die "tar 包已解压，但没有找到完整的 inference-toolkit 目录：$staging_dir"
+    fi
+
+    backup_existing_toolkit "tar"
+    if [[ "$candidate_dir" == "$staging_dir" ]]; then
+        mv "$staging_dir" "$WORKSPACE_DIR"
+    else
+        mv "$candidate_dir" "$WORKSPACE_DIR"
+        rmdir "$staging_dir" 2>/dev/null \
+            || warn "解压临时目录仍有其他内容，已保留：$staging_dir"
+    fi
+    log "tar 包中的 inference-toolkit 已安装：$WORKSPACE_DIR"
+}
+
 if (( SKIP_TOOLKIT )); then
     log "按参数跳过 inference-toolkit 部署"
 else
@@ -643,6 +719,12 @@ else
         elif (( UPDATE_TOOLKIT )); then
             warn "当前是手动解压目录，不含 .git，无法执行 --update-toolkit"
         fi
+    elif toolkit_is_ready "$TOOLKIT_EXTRACTED_DIR"; then
+        log "检测到已解压目录，跳过 clone：$TOOLKIT_EXTRACTED_DIR"
+        adopt_extracted_toolkit "$TOOLKIT_EXTRACTED_DIR" "手动解压的 inference-toolkit"
+    elif [[ -s "$TOOLKIT_ARCHIVE" && -r "$TOOLKIT_ARCHIVE" ]]; then
+        log "检测到 inference-toolkit tar 包，跳过 clone：$TOOLKIT_ARCHIVE"
+        install_toolkit_from_archive "$TOOLKIT_ARCHIVE"
     elif [[ -e "$WORKSPACE_DIR" || -L "$WORKSPACE_DIR" ]]; then
         TOOLKIT_TIMESTAMP="$(date +%Y%m%d%H%M%S).$$"
         TOOLKIT_BACKUP="${WORKSPACE_DIR}.bak.${TOOLKIT_TIMESTAMP}"
