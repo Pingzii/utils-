@@ -89,7 +89,9 @@ usage() {
      GLM-5.2 默认值，
      已经改成其他模型的配置保持不变。
   7. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
-  8. 部署后运行 claude-green；需要跳过权限确认时显式运行：
+  8. inference-toolkit 支持 Git clone 或手动解压目录；clone 失败时会打印
+     tar 包下载、上传和解压指引。
+  9. 部署后运行 claude-green；需要跳过权限确认时显式运行：
        claude-green --dangerous
 EOF
 }
@@ -591,30 +593,81 @@ os.chmod(target, 0o755)
 PY
 expose_command claude-green "${HOME}/.local/bin/claude-green"
 
+toolkit_is_ready() {
+    local toolkit_dir="$1"
+    [[ -d "$toolkit_dir" ]] \
+        && [[ -d "$toolkit_dir/skills" ]] \
+        && [[ -f "$toolkit_dir/engineering-context/scripts/init_workspace.py" ]]
+}
+
+print_toolkit_manual_install_help() {
+    cat >&2 <<EOF
+
+[GreenAgent] inference-toolkit clone 失败，请手动安装：
+
+  1. 在可以访问 CodeHub 的浏览器中打开：
+     $REPO_URL
+
+  2. 下载仓库 tar 包，并上传到：
+     $GREEN_ZONE_HOME
+
+  3. 在绿区机器上解压 tar 包：
+     cd $GREEN_ZONE_HOME
+     tar -xf <实际下载的 tar 包文件名>
+
+  4. 确保解压后的最终目录名为：
+     $WORKSPACE_DIR
+
+     如果这个目录已存在但内容不完整，请先自行改名备份，再把解压出来的
+     仓库目录改名为 inference-toolkit。
+
+  5. 最终至少应存在：
+     $WORKSPACE_DIR/skills
+     $WORKSPACE_DIR/engineering-context/scripts/init_workspace.py
+
+  6. 准备完成后，重新运行：
+     bash $SCRIPT_NAME
+
+EOF
+}
+
 if (( SKIP_TOOLKIT )); then
     log "按参数跳过 inference-toolkit 部署"
 else
     source_proxy
-    if [[ -d "$WORKSPACE_DIR/.git" ]]; then
-        log "inference-toolkit 已存在：$WORKSPACE_DIR"
-        if (( UPDATE_TOOLKIT )); then
+    if toolkit_is_ready "$WORKSPACE_DIR"; then
+        log "检测到可用 inference-toolkit 目录，跳过 clone：$WORKSPACE_DIR"
+        if [[ -d "$WORKSPACE_DIR/.git" ]] && (( UPDATE_TOOLKIT )); then
             log "更新 inference-toolkit（git pull --ff-only）"
             git -C "$WORKSPACE_DIR" pull --ff-only
+        elif (( UPDATE_TOOLKIT )); then
+            warn "当前是手动解压目录，不含 .git，无法执行 --update-toolkit"
         fi
     elif [[ -e "$WORKSPACE_DIR" || -L "$WORKSPACE_DIR" ]]; then
         TOOLKIT_TIMESTAMP="$(date +%Y%m%d%H%M%S).$$"
         TOOLKIT_BACKUP="${WORKSPACE_DIR}.bak.${TOOLKIT_TIMESTAMP}"
         TOOLKIT_CLONE="${WORKSPACE_DIR}.clone.${TOOLKIT_TIMESTAMP}"
-        warn "工作目录已存在但不是 Git 仓库，将先 clone 新仓库并备份旧目录"
+        warn "inference-toolkit 目录存在但内容不完整，将先 clone 新仓库并备份旧目录"
         log "临时 clone 目录：$TOOLKIT_CLONE"
-        git clone "$REPO_URL" "$TOOLKIT_CLONE"
+        if ! git clone "$REPO_URL" "$TOOLKIT_CLONE"; then
+            print_toolkit_manual_install_help
+            die "inference-toolkit clone 失败，已停止；原目录未移动"
+        fi
         mv "$WORKSPACE_DIR" "$TOOLKIT_BACKUP"
         mv "$TOOLKIT_CLONE" "$WORKSPACE_DIR"
         log "旧 inference-toolkit 已完整备份：$TOOLKIT_BACKUP"
         log "新 inference-toolkit 已就绪：$WORKSPACE_DIR"
     else
         log "clone inference-toolkit"
-        git clone "$REPO_URL" "$WORKSPACE_DIR"
+        if ! git clone "$REPO_URL" "$WORKSPACE_DIR"; then
+            print_toolkit_manual_install_help
+            die "inference-toolkit clone 失败，已停止"
+        fi
+    fi
+
+    if ! toolkit_is_ready "$WORKSPACE_DIR"; then
+        print_toolkit_manual_install_help
+        die "inference-toolkit 目录不完整：$WORKSPACE_DIR"
     fi
 
     INIT_SCRIPT="$WORKSPACE_DIR/engineering-context/scripts/init_workspace.py"
