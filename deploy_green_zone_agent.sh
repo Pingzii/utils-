@@ -19,6 +19,7 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_REPO_URL="https://szv-open.codehub.huawei.com/innersource/inference-toolkit_G/inference-toolkit.git"
 OFFLINE_INSTALLER_SOURCE="root@141.61.92.13:/home/w00984239/claude-offline-aarch64.sh"
+DEFAULT_CLAUDE_MODEL="DeepSeek-V4-Flash"
 
 API_KEY_FILE=""
 BASE_URL=""
@@ -79,12 +80,16 @@ usage() {
      scp 失败时立即停止，不继续安装。
   2. 首次运行会静默提示输入 API Key，并自动保存为：
        <green-home>/.secrets/claude.key
-     后续运行默认复用；文件权限自动设置为 600。
+     后续运行默认复用；文件权限自动设置为 600。该 Key 会同时写入
+     ANTHROPIC_AUTH_TOKEN 和 ANTHROPIC_API_KEY。
   3. 默认目录与 create_container.sh 的 /home/s00988495 约定一致。
   4. CodeHub hosts 地址固定为 141.2.250.30，部署日志会打印该地址。
   5. 只有灵枢明确提供自定义网关时，才需要传 --base-url。
-  6. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
-  7. 部署后运行 claude-green；需要跳过权限确认时显式运行：
+  6. Claude 默认模型为 $DEFAULT_CLAUDE_MODEL；仅替换缺失、空值或原始
+     GLM-5.2 默认值，
+     已经改成其他模型的配置保持不变。
+  7. 未提供 env 文件时，保留 init_workspace.py 生成的模板，之后按机器填写。
+  8. 部署后运行 claude-green；需要跳过权限确认时显式运行：
        claude-green --dangerous
 EOF
 }
@@ -348,7 +353,12 @@ if [[ -n "$BASE_URL" ]]; then
 else
     log "合并 Claude settings；未传 --base-url，保留已有 Base URL 配置（不会输出 API Key）"
 fi
-python3 - "$SETTINGS_PATH" "$API_KEY_FILE" "$BASE_URL" <<'PY'
+log "API Key 将同时写入 ANTHROPIC_AUTH_TOKEN 和 ANTHROPIC_API_KEY"
+python3 - \
+    "$SETTINGS_PATH" \
+    "$API_KEY_FILE" \
+    "$BASE_URL" \
+    "$DEFAULT_CLAUDE_MODEL" <<'PY'
 import json
 import os
 import pathlib
@@ -360,6 +370,7 @@ import time
 settings_path = pathlib.Path(sys.argv[1])
 key_path = pathlib.Path(sys.argv[2])
 base_url = sys.argv[3].strip()
+default_model = sys.argv[4]
 token = key_path.read_text(encoding="utf-8").strip()
 if not token:
     raise SystemExit(f"API Key 文件为空：{key_path}")
@@ -389,6 +400,29 @@ if not isinstance(env, dict):
 if base_url:
     env["ANTHROPIC_BASE_URL"] = base_url
 env["ANTHROPIC_AUTH_TOKEN"] = token
+env["ANTHROPIC_API_KEY"] = token
+
+# 只替换离线包的 GLM-5.2 默认值。用户已经设置成其他模型时，不覆盖。
+model_keys = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+updated_model_keys = []
+preserved_model_keys = []
+legacy_default_models = {"GLM-5.2", "GLM-5.2[1M]"}
+for key in model_keys:
+    current = env.get(key)
+    replace = current is None
+    if isinstance(current, str):
+        normalized = current.strip().upper()
+        replace = not normalized or normalized in legacy_default_models
+    if replace:
+        env[key] = default_model
+        updated_model_keys.append(key)
+    else:
+        preserved_model_keys.append(key)
 
 fd, temp_name = tempfile.mkstemp(prefix=".settings.", suffix=".json", dir=settings_path.parent)
 try:
@@ -400,6 +434,17 @@ try:
 finally:
     if os.path.exists(temp_name):
         os.unlink(temp_name)
+
+if updated_model_keys:
+    print(
+        f"[GreenAgent] Claude 默认模型已设为 {default_model}："
+        + ", ".join(updated_model_keys)
+    )
+if preserved_model_keys:
+    print(
+        "[GreenAgent] 以下模型项已有非默认配置，保持不变："
+        + ", ".join(preserved_model_keys)
+    )
 PY
 
 log "写入持久化 PATH 配置"
@@ -645,6 +690,7 @@ cat <<EOF
 [GreenAgent] 部署完成。
 [GreenAgent] Claude settings：$SETTINGS_PATH
 [GreenAgent] API Key 文件：$API_KEY_FILE
+[GreenAgent] Claude 默认模型：$DEFAULT_CLAUDE_MODEL（已有非默认配置不会覆盖）
 [GreenAgent] 绿区持久化目录：$GREEN_ZONE_HOME
 [GreenAgent] AFD 根目录：$AFD_ROOT
 [GreenAgent] vLLM：$VLLM_REPO_DIR
