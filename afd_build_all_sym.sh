@@ -183,30 +183,15 @@ LOG="${LOG_DIR}/afd_build_all.log"
 #   上一次成功 build 时对应仓库的 Git HEAD
 #
 #
-# 下一次执行：
+# 下一次执行只有同时满足以下条件才跳过 build：
 #
-#   当前 HEAD == stamp
+#   1. 当前 HEAD == stamp
+#   2. 当前容器的 Python 环境已安装对应 distribution
+#   3. distribution 是指向当前源码目录的 editable install
+#   4. vLLM 已安装版本以目标版本 0.26.0 开头
 #
-#       ↓
-#
-#   说明该源码版本已经成功 build
-#
-#       ↓
-#
-#   跳过 build
-#
-#
-# 如果：
-#
-#   当前 HEAD != stamp
-#
-#       ↓
-#
-#   源码发生变化
-#
-#       ↓
-#
-#   重新 build
+# 这样即使 /home 中的 stamp 跨容器保留，而新容器仍带着镜像预装的
+# 旧版 wheel，也会自动重新安装，不会错误跳过。
 #
 #
 # 所以：
@@ -235,6 +220,8 @@ STAMP_DIR="${ROOT}/.build_stamps"
 VLLM_URL="https://github.com/vllm-project/vllm.git"
 
 VLLM_REF="v0.26.0"
+
+VLLM_VERSION_PREFIX="${VLLM_REF#v}"
 
 
 # -----------------------------------------------------------------------------
@@ -950,20 +937,98 @@ echo
 #     → 已经 build，可以 skip
 #
 #
-# 判断：
+# 只有同时满足以下条件才允许 skip：
 #
-#   当前 Git HEAD
-#
-#       VS
-#
-#   stamp 中保存的 HEAD
+#   1. 当前 Git HEAD == stamp 中保存的 HEAD
+#   2. 当前 Python 环境已安装对应 distribution
+#   3. distribution 是指向当前 repo 的 editable install
+#   4. 如果指定 expected_version_prefix，已安装版本必须匹配
 #
 # =============================================================================
+
+check_installed_package()
+{
+    local distribution_name="$1"
+    local expected_repo="$2"
+    local expected_version_prefix="${3:-}"
+
+
+    python3 - \
+        "$distribution_name" \
+        "$expected_repo" \
+        "$expected_version_prefix" <<'PY'
+import json
+import sys
+from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+distribution_name, expected_repo, expected_version_prefix = sys.argv[1:]
+expected_path = Path(expected_repo).resolve()
+
+try:
+    dist = distribution(distribution_name)
+except PackageNotFoundError:
+    print(f"[install-check] {distribution_name}: not installed")
+    raise SystemExit(1)
+
+installed_version = dist.version
+print(f"[install-check] {distribution_name}: version={installed_version}")
+
+if (
+    expected_version_prefix
+    and not installed_version.startswith(expected_version_prefix)
+):
+    print(
+        f"[install-check] {distribution_name}: expected version prefix="
+        f"{expected_version_prefix}"
+    )
+    raise SystemExit(1)
+
+raw_direct_url = dist.read_text("direct_url.json")
+if not raw_direct_url:
+    print(
+        f"[install-check] {distribution_name}: direct_url.json missing; "
+        "not verified as editable"
+    )
+    raise SystemExit(1)
+
+try:
+    direct_url = json.loads(raw_direct_url)
+except json.JSONDecodeError as exc:
+    print(f"[install-check] {distribution_name}: invalid direct_url.json: {exc}")
+    raise SystemExit(1) from exc
+
+if direct_url.get("dir_info", {}).get("editable") is not True:
+    print(f"[install-check] {distribution_name}: installation is not editable")
+    raise SystemExit(1)
+
+parsed_url = urlparse(direct_url.get("url", ""))
+if parsed_url.scheme != "file":
+    print(
+        f"[install-check] {distribution_name}: unexpected editable URL="
+        f"{direct_url.get('url')!r}"
+    )
+    raise SystemExit(1)
+
+installed_path = Path(unquote(parsed_url.path)).resolve()
+print(f"[install-check] {distribution_name}: editable_path={installed_path}")
+print(f"[install-check] {distribution_name}: expected_path={expected_path}")
+
+if installed_path != expected_path:
+    print(f"[install-check] {distribution_name}: editable path mismatch")
+    raise SystemExit(1)
+
+print(f"[install-check] {distribution_name}: OK")
+PY
+}
 
 need_build()
 {
     local repo="$1"
     local stamp="$2"
+    local distribution_name="$3"
+    local expected_version_prefix="${4:-}"
 
     local current_head
 
@@ -975,6 +1040,7 @@ need_build()
 
     # --force 永远重新 build
     if [[ "$FORCE" -eq 1 ]]; then
+        echo "[build-check] --force requested: rebuild $distribution_name"
         return 0
     fi
 
@@ -983,6 +1049,7 @@ need_build()
     #
     # 说明还没成功 build 过。
     if [[ ! -f "$stamp" ]]; then
+        echo "[build-check] stamp missing: rebuild $distribution_name"
         return 0
     fi
 
@@ -996,13 +1063,24 @@ need_build()
 
     # Git HEAD 发生变化。
     if [[ "$current_head" != "$built_head" ]]; then
+        echo "[build-check] Git HEAD changed: rebuild $distribution_name"
         return 0
     fi
 
 
-    # HEAD 相同：
-    #
-    # 已经 build。
+    # stamp 可能来自另一个容器。即使源码 HEAD 没变，当前容器中也可能仍然
+    # 安装着基础镜像自带的旧 wheel，因此还必须检查当前 Python 环境。
+    if ! check_installed_package \
+        "$distribution_name" \
+        "$repo" \
+        "$expected_version_prefix"; then
+
+        echo "[build-check] Python installation mismatch: rebuild $distribution_name"
+        return 0
+    fi
+
+
+    echo "[build-check] Git stamp and Python editable install both match."
     return 1
 }
 
@@ -1077,7 +1155,9 @@ fi
 
 if need_build \
     "$VLLM_DIR" \
-    "$VLLM_STAMP"; then
+    "$VLLM_STAMP" \
+    "vllm" \
+    "$VLLM_VERSION_PREFIX"; then
 
 
     echo
@@ -1092,6 +1172,12 @@ if need_build \
     python3 -m pip install \
         -e . \
         --no-build-isolation
+
+
+    check_installed_package \
+        "vllm" \
+        "$VLLM_DIR" \
+        "$VLLM_VERSION_PREFIX"
 
 
     write_stamp \
@@ -1182,7 +1268,8 @@ unset LD_PRELOAD || true
 
 if need_build \
     "$VLLM_ASCEND_DIR" \
-    "$VLLM_ASCEND_STAMP"; then
+    "$VLLM_ASCEND_STAMP" \
+    "vllm-ascend"; then
 
 
     echo
@@ -1196,6 +1283,11 @@ if need_build \
     python3 -m pip install \
         -e . \
         --no-build-isolation
+
+
+    check_installed_package \
+        "vllm-ascend" \
+        "$VLLM_ASCEND_DIR"
 
 
     write_stamp \
@@ -1245,7 +1337,8 @@ cd "$AFD_PLUGIN_DIR"
 
 if need_build \
     "$AFD_PLUGIN_DIR" \
-    "$AFD_PLUGIN_STAMP"; then
+    "$AFD_PLUGIN_STAMP" \
+    "afd-plugin"; then
 
 
     echo
@@ -1259,6 +1352,11 @@ if need_build \
     python3 -m pip install \
         -e . \
         --no-build-isolation
+
+
+    check_installed_package \
+        "afd-plugin" \
+        "$AFD_PLUGIN_DIR"
 
 
     write_stamp \
