@@ -201,7 +201,7 @@ absolute_path() {
         "$1"
 }
 
-# 对齐 create_container.sh 和 afd_build_all_sym.sh 的目录约定。
+# 对齐 create_container.sh 和 afd_build_and_compile.sh 的目录约定。
 GREEN_ZONE_HOME="$(absolute_path "$GREEN_ZONE_HOME")"
 [[ -n "$AFD_ROOT" ]] || AFD_ROOT="$GREEN_ZONE_HOME/AFD"
 [[ -n "$PROXY_SCRIPT" ]] || PROXY_SCRIPT="$GREEN_ZONE_HOME/proxy.sh"

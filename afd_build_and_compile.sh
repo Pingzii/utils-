@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # =============================================================================
-# afd_build_all_sym.sh
+# afd_build_and_compile.sh
 #
 # A5 / Ascend950 AFD 推理栈一键构建脚本
 #
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !!! 重要：首次使用必须添加 --force 参数                              !!!
 # !!!                                                                        !!!
-# !!!   bash afd_build_all_sym.sh --force                                    !!!
+# !!!   bash afd_build_and_compile.sh --force                                !!!
 # !!!                                                                        !!!
 # !!! 新容器可能复用 /home 下旧的源码和 build stamp，但容器内 Python 包    !!!
 # !!! 仍来自基础镜像。不加 --force 可能错误跳过 vLLM / vLLM-Ascend 安装。   !!!
@@ -75,12 +75,12 @@
 #
 # 首次执行（必须）：
 #
-#   bash afd_build_all_sym.sh --force
+#   bash afd_build_and_compile.sh --force
 #
 #
 # 后续执行（确认当前容器已经完整构建成功）：
 #
-#   bash afd_build_all_sym.sh
+#   bash afd_build_and_compile.sh
 #
 #
 # 本脚本不会：
@@ -317,7 +317,7 @@ step "0/5 检查基础环境"
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo "!!! 重要：首次使用必须运行："
 echo "!!!"
-echo "!!!   bash afd_build_all_sym.sh --force"
+echo "!!!   bash afd_build_and_compile.sh --force"
 echo "!!!"
 echo "!!! 不带 --force 只适用于当前容器已经完整构建成功后的重复执行。"
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -328,7 +328,7 @@ if [[ "$FORCE" -eq 1 ]]; then
 else
     echo "[WARN] 当前未使用 --force。"
     echo "[WARN] 如果这是首次使用，请立即停止并改用："
-    echo "[WARN] bash afd_build_all_sym.sh --force"
+    echo "[WARN] bash afd_build_and_compile.sh --force"
 fi
 
 
