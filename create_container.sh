@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 #
 # =============================================================================
-# create-container.sh
+# create_container.sh
 #
 # 用法：
 #
-#   bash create-container.sh <IMAGE> <CONTAINER_NAME>
+#   bash create_container.sh <IMAGE> <CONTAINER_NAME> host
+#   bash create_container.sh <IMAGE> <CONTAINER_NAME> port <HOST_PORT:CONTAINER_PORT> [...]
 #
 # 示例：
 #
-#   bash create-container.sh \
+#   # 使用 host 网络
+#   bash create_container.sh \
 #       vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64 \
-#       my-vllm
+#       my-vllm \
+#       host
+#
+#   # 使用 bridge 网络，并映射 SSH 与 vLLM 端口
+#   bash create_container.sh \
+#       vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64 \
+#       my-vllm \
+#       port \
+#       2222:22 \
+#       18000:18000
 #
 #
 # Host 侧：
@@ -283,23 +294,31 @@ fi
 
 
 # =============================================================================
-# 1. 参数检查
+# 1. 参数检查与网络配置
 # =============================================================================
 
-if [[ $# -ne 2 ]]; then
-
+usage() {
     echo
     echo "Usage:"
     echo
-    echo "  bash $0 <IMAGE> <CONTAINER_NAME>"
+    echo "  Host network:"
+    echo "    bash $0 <IMAGE> <CONTAINER_NAME> host"
     echo
+    echo "  Port mapping with bridge network:"
+    echo "    bash $0 <IMAGE> <CONTAINER_NAME> port <HOST_PORT:CONTAINER_PORT> [...]"
+    echo
+    echo "Examples:"
+    echo
+    echo "  bash $0 my-image:latest my-vllm host"
+    echo "  bash $0 my-image:latest my-vllm port 2222:22"
+    echo "  bash $0 my-image:latest my-vllm port 2222:22 18000:18000"
+    echo
+}
 
-    echo "Example:"
-    echo
-    echo "  bash $0 \\"
-    echo "      vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64 \\"
-    echo "      my-vllm"
-    echo
+
+if [[ $# -lt 3 ]]; then
+
+    usage
 
     exit 2
 fi
@@ -307,6 +326,69 @@ fi
 
 IMAGE="$1"
 CONTAINER_NAME="$2"
+NETWORK_MODE="$3"
+shift 3
+
+PORT_MAPPINGS=("$@")
+DOCKER_NETWORK_ARGS=()
+PORT_BINDING_KEYS=()
+PORT_BINDING_HOST_PORTS=()
+
+
+case "$NETWORK_MODE" in
+    host)
+        if [[ ${#PORT_MAPPINGS[@]} -ne 0 ]]; then
+            echo "[ERROR] Port mappings cannot be used with host network mode." >&2
+            usage
+            exit 2
+        fi
+
+        DOCKER_NETWORK_ARGS=(--network host)
+        ;;
+
+    port)
+        if [[ ${#PORT_MAPPINGS[@]} -eq 0 ]]; then
+            echo "[ERROR] Port mode requires at least one HOST_PORT:CONTAINER_PORT mapping." >&2
+            usage
+            exit 2
+        fi
+
+        DOCKER_NETWORK_ARGS=(--network bridge)
+
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            if [[ ! "$mapping" =~ ^[1-9][0-9]*:[1-9][0-9]*(/(tcp|udp|sctp))?$ ]]; then
+                echo "[ERROR] Invalid port mapping: $mapping" >&2
+                echo "        Expected: HOST_PORT:CONTAINER_PORT[/tcp|udp|sctp]" >&2
+                exit 2
+            fi
+
+            host_port="${mapping%%:*}"
+            container_spec="${mapping#*:}"
+            container_port="${container_spec%%/*}"
+            protocol="tcp"
+
+            if [[ "$container_spec" == */* ]]; then
+                protocol="${container_spec##*/}"
+            fi
+
+            if (( host_port > 65535 || container_port > 65535 )); then
+                echo "[ERROR] Port must be between 1 and 65535: $mapping" >&2
+                exit 2
+            fi
+
+            DOCKER_NETWORK_ARGS+=(--publish "$mapping")
+            PORT_BINDING_KEYS+=("${container_port}/${protocol}")
+            PORT_BINDING_HOST_PORTS+=("$host_port")
+        done
+        ;;
+
+    *)
+        echo "[ERROR] Unknown network mode: $NETWORK_MODE" >&2
+        echo "        Expected: host or port" >&2
+        usage
+        exit 2
+        ;;
+esac
 
 
 echo
@@ -321,6 +403,16 @@ echo "  $IMAGE"
 echo
 echo "Container:"
 echo "  $CONTAINER_NAME"
+
+echo
+echo "Network mode:"
+echo "  $NETWORK_MODE"
+
+if [[ "$NETWORK_MODE" == "port" ]]; then
+    echo
+    echo "Port mappings:"
+    printf '  %s\n' "${PORT_MAPPINGS[@]}"
+fi
 
 echo
 
@@ -491,6 +583,50 @@ if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     echo "       $CONTAINER_NAME"
 
 
+    ACTUAL_NETWORK_MODE="$(
+        docker inspect \
+            -f '{{.HostConfig.NetworkMode}}' \
+            "$CONTAINER_NAME"
+    )"
+
+    echo "[INFO] Existing container network mode: $ACTUAL_NETWORK_MODE"
+
+    if [[ "$NETWORK_MODE" == "host" && "$ACTUAL_NETWORK_MODE" != "host" ]]; then
+        echo "[ERROR] Existing container does not use host network mode." >&2
+        echo "        Docker cannot change the network mode of an existing container." >&2
+        echo "        Remove or rename the existing container, then run this script again." >&2
+        exit 1
+    fi
+
+    if [[ "$NETWORK_MODE" == "port" && "$ACTUAL_NETWORK_MODE" != "bridge" ]]; then
+        echo "[ERROR] Existing container does not use bridge network mode." >&2
+        echo "        Docker cannot change the network mode of an existing container." >&2
+        echo "        Remove or rename the existing container, then run this script again." >&2
+        exit 1
+    fi
+
+    if [[ "$NETWORK_MODE" == "port" ]]; then
+        for index in "${!PORT_BINDING_KEYS[@]}"; do
+            binding_key="${PORT_BINDING_KEYS[$index]}"
+            expected_host_port="${PORT_BINDING_HOST_PORTS[$index]}"
+            actual_host_port="$(
+                docker inspect \
+                    -f "{{with index .HostConfig.PortBindings \"${binding_key}\"}}{{(index . 0).HostPort}}{{end}}" \
+                    "$CONTAINER_NAME"
+            )"
+
+            if [[ "$actual_host_port" != "$expected_host_port" ]]; then
+                echo "[ERROR] Existing container port mapping does not match." >&2
+                echo "        Requested: ${expected_host_port}:${binding_key}" >&2
+                echo "        Existing host port: ${actual_host_port:-not published}" >&2
+                echo "        Docker cannot add or change published ports on an existing container." >&2
+                echo "        Remove or rename the existing container, then run this script again." >&2
+                exit 1
+            fi
+        done
+    fi
+
+
     RUNNING="$(
         docker inspect \
             -f '{{.State.Running}}' \
@@ -529,7 +665,7 @@ else
         --interactive \
         --tty \
         --detach \
-        --net=host \
+        "${DOCKER_NETWORK_ARGS[@]}" \
         --pid=host \
         --privileged=true \
         --shm-size=2g \
@@ -589,7 +725,13 @@ echo "[INFO] Container status:"
 
 docker ps \
     --filter "name=^/${CONTAINER_NAME}$" \
-    --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+    --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
+
+if [[ "$NETWORK_MODE" == "port" ]]; then
+    echo
+    echo "[INFO] Published ports:"
+    docker port "$CONTAINER_NAME"
+fi
 
 
 # =============================================================================
