@@ -1,122 +1,153 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
 echo "========== Init SSH Service =========="
 
-if [[ "${EUID}" -ne 0 ]]; then
-    echo "[ERROR] Please run this script as root." >&2
-    exit 1
+
+# =========================
+# 1. 安装 openssh-server
+# =========================
+
+if ! command -v sshd >/dev/null 2>&1; then
+    echo "[INFO] Installing openssh-server..."
+
+    yum install -y openssh-server openssh-clients
+
+else
+    echo "[INFO] sshd already installed"
 fi
 
-# =========================
-# 1. Install packages
-# =========================
-
-echo "[INFO] Installing required packages..."
-
-PACKAGES=(openssh-server openssh-clients iproute)
-
-if ! command -v yum >/dev/null 2>&1; then
-    echo "[ERROR] yum command not found." >&2
-    exit 1
-fi
-
-yum install -y "${PACKAGES[@]}"
 
 # =========================
-# 2. Set root password
+# 2. 设置 root 密码
 # =========================
 
-ROOT_PASSWORD="${ROOT_PASSWORD:-}"
+echo "[INFO] Configuring root password..."
 
-if [[ -z "${ROOT_PASSWORD}" ]]; then
-    if [[ ! -t 0 ]]; then
-        echo "[ERROR] Set ROOT_PASSWORD when running non-interactively." >&2
+if [ -z "${ROOT_PASSWORD}" ]; then
+
+    echo "[INFO] ROOT_PASSWORD environment variable not found"
+
+    read -s -p "Enter root password: " ROOT_PASSWORD
+    echo ""
+
+    read -s -p "Confirm root password: " ROOT_PASSWORD_CONFIRM
+    echo ""
+
+    if [ "${ROOT_PASSWORD}" != "${ROOT_PASSWORD_CONFIRM}" ]; then
+        echo "[ERROR] Passwords do not match!"
         exit 1
     fi
 
-    read -rsp "Enter root password: " ROOT_PASSWORD
-    echo
+else
+
+    echo "[INFO] Using password from ROOT_PASSWORD environment variable"
+
 fi
 
-if [[ -z "${ROOT_PASSWORD}" ]]; then
-    echo "[ERROR] Root password cannot be empty." >&2
-    exit 1
-fi
 
-echo "[INFO] Setting root password..."
-printf 'root:%s\n' "${ROOT_PASSWORD}" | chpasswd
-unset ROOT_PASSWORD
+echo "root:${ROOT_PASSWORD}" | chpasswd
+
 
 # =========================
-# 3. Configure sshd
+# 3. 配置 sshd
 # =========================
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
 echo "[INFO] Configuring sshd..."
 
-set_sshd_option() {
-    local key="$1"
-    local value="$2"
 
-    if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "${SSHD_CONFIG}"; then
-        sed -ri \
-            "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]].*|${key} ${value}|" \
-            "${SSHD_CONFIG}"
-    else
-        printf '%s %s\n' "${key}" "${value}" >>"${SSHD_CONFIG}"
-    fi
-}
+# 允许 root 登录
+if grep -q "^PermitRootLogin" ${SSHD_CONFIG}; then
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' ${SSHD_CONFIG}
+else
+    echo "PermitRootLogin yes" >> ${SSHD_CONFIG}
+fi
 
-set_sshd_option "PermitRootLogin" "yes"
-set_sshd_option "PasswordAuthentication" "yes"
+
+# 开启密码认证
+if grep -q "^PasswordAuthentication" ${SSHD_CONFIG}; then
+    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' ${SSHD_CONFIG}
+else
+    echo "PasswordAuthentication yes" >> ${SSHD_CONFIG}
+fi
+
+
+# 设置 SSH 端口
+if grep -q "^Port" ${SSHD_CONFIG}; then
+    sed -i 's/^Port.*/Port 22/' ${SSHD_CONFIG}
+else
+    echo "Port 22" >> ${SSHD_CONFIG}
+fi
+
 
 # =========================
-# 4. Generate SSH keys
+# 4. 创建 ssh runtime 目录
 # =========================
 
-echo "[INFO] Generating SSH host keys..."
+echo "[INFO] Preparing ssh runtime directory..."
+
+mkdir -p /run/sshd
+chmod 755 /run/sshd
+
+
+# =========================
+# 5. 生成 host key
+# =========================
+
+echo "[INFO] Generating ssh host keys..."
+
 ssh-keygen -A
 
-echo "[INFO] Validating sshd configuration..."
-/usr/sbin/sshd -t
 
 # =========================
-# 5. Start sshd
+# 6. 检查 sshd 配置
 # =========================
 
-echo "[INFO] Starting sshd..."
+echo "[INFO] Checking sshd configuration..."
 
-if pgrep -x sshd >/dev/null; then
-    echo "[INFO] sshd already running"
+sshd -t
+
+
+# =========================
+# 7. 启动 sshd
+# =========================
+
+echo "[INFO] Checking SSH listener..."
+
+if ss -lnt | grep -q ":22"; then
+
+    echo "[INFO] SSH already listening on port 22"
+
 else
+
+    echo "[INFO] Starting sshd..."
+
+    # Docker环境不要使用systemctl
+    # 不使用 sshd -D &
     /usr/sbin/sshd
+
 fi
 
-sleep 2
 
 # =========================
-# 6. Check status
+# 8. 检查状态
 # =========================
 
-echo
-echo "========== SSH Process =========="
-ps -ef | grep '[s]shd' || true
+echo "========== SSH Status =========="
 
-echo
-echo "========== Container Listening Ports =========="
+ss -lntp | grep ":22" || true
 
-if command -v ss >/dev/null 2>&1; then
-    ss -lntp
-else
-    echo "[WARN] ss command not found"
-fi
 
-echo
+echo ""
+
 echo "========== SSH Ready =========="
+
 echo "User: root"
-echo "Password: configured (not printed)"
-echo
+echo "Password: configured"
+
+echo ""
+
 echo "Login example:"
 echo "ssh root@<host-ip> -p <mapped-port>"
