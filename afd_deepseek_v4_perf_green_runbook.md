@@ -128,10 +128,10 @@ ISL + OSL <= 32768
 正式全量测试前，必须先完成唯一的 smoke test：
 
 ```text
-AFD 4A2F + BS=32 + dataset_size=128
+AFD 2A2F + BS=32 + dataset_size=128
 ```
 
-smoke test 失败时不得进入其余 23 个测试点。
+smoke test 失败时不得进入其余 23 个测试点。如果该点的 config、dataset、日志、work directory 和指标均完整，则它直接计入 24 个正式测试点，不重复执行。
 
 ## 4. 执行边界
 
@@ -467,8 +467,8 @@ cudagraph_capture_sizes 包含 batchsize
 接口：
 
 ```bash
-bash run_one.sh afd 4A2F 128
-bash run_one.sh mix 6card 128
+bash run_one.sh afd 2A2F 128
+bash run_one.sh mix 4card 128
 ```
 
 `run_one.sh` 必须按顺序完成：
@@ -524,17 +524,20 @@ BS_LIST=(32 64 128 256)
 第一步只执行：
 
 ```bash
-bash run_one.sh afd 4A2F 32
+bash run_one.sh afd 2A2F 32
 ```
 
-确认 smoke test 成功、dataset size 为 128、graph capture/replay 正常后，才遍历完整矩阵。
+确认 smoke test 成功、dataset size 为 128、graph capture/replay 正常且产物完整后，将它记为第一个正式测试点，然后继续其余 23 个点。
 
-建议完整顺序：
+必须按最小可交付比较单元执行：先完整跑完一组 AFD，再立即跑与它总卡数相同的普通混步，完成这一对后才进入下一对。
 
 ```text
-2A2F → 4card mix
-4A2F → 6card mix
-6A2F → 8card mix
+2A2F（BS 32/64/128/256）
+→ 4card mix（BS 32/64/128/256）
+→ 4A2F（BS 32/64/128/256）
+→ 6card mix（BS 32/64/128/256）
+→ 6A2F（BS 32/64/128/256）
+→ 8card mix（BS 32/64/128/256）
 ```
 
 每种配置内部按：
@@ -669,5 +672,5 @@ tar -C /home/s00988495 \
 
 本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4。正式命令只能使用 ais_bench CONFIG -m perf --num-warmups 1 -w WORK_DIR，不使用 --num-prompts，也不使用旧的 --models/--datasets/--mode perf 流程。
 
-先执行 4A2F+BS32 smoke test，成功后再执行 24 个测试点。任何失败立即停止，在绿区保存原始文件，并在当前对话中打印错误摘要与日志尾部。不要修改源码，不要执行 git push、scp、curl 上传或其他跨区传输操作。
+先执行 2A2F+BS32 smoke test；产物完整时直接计入正式结果，不重复跑。随后严格按最小完成顺序执行：先跑完 2A2F 的 BS32/64/128/256，再跑 4card mix；然后跑 4A2F，再跑 6card mix；最后跑 6A2F，再跑 8card mix。完成一对等卡配置后再进入下一对。任何失败立即停止，在绿区保存原始文件，并在当前对话中打印错误摘要与日志尾部。不要修改源码，不要执行 git push、scp、curl 上传或其他跨区传输操作。
 ```
