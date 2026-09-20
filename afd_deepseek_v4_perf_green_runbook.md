@@ -1,434 +1,673 @@
-# AFD + DeepSeek-V4-Flash 性能测试：绿区执行手册
+# AFD 与普通混步性能对比：绿区 Agent 执行手册
 
-本文档给绿区 Agent 使用。蓝区负责制定方案、分析结果和处理代码问题；绿区只按本手册执行命令并在绿区本机保存原始数据。发生失败时，绿区 Agent 在绿区对话中输出错误摘要，由用户手动复制给蓝区 Agent；绿区不能直接向蓝区传文件。
+本文档用于 Ascend A5 环境中的 DeepSeek-V4-Flash 性能测试。蓝区负责确定实验口径和分析数据；绿区 Agent 负责检查现有环境、生成测试文件、执行测试并在绿区本机保存产物。
 
-## 1. 测试目标与固定口径
+绿区不能直接向蓝区传文件。失败时只在绿区对话中打印摘要和必要日志，由用户手动复制给蓝区。
 
-目标是比较不同 Attention/FFN 配比下，固定长度请求的吞吐量：
+## 1. 本轮实验的唯一口径
 
-- 横坐标：`A/F = M/N`
-- 纵坐标：吞吐量
-- 两条曲线：输入上下文长度 `2K` 和 `32K`
-- 测试模型：`/mnt/weight/A5-weights/DeepSeek-V4-Flash`
-- 服务名：`DeepSeek-V4-Flash`
-- 只向 Attention 服务端口 `18000` 发送请求
+### 1.1 测试对象
 
-测试矩阵：
+| mode | topology | Attention 卡 | FFN 卡 | 总卡数 | 对比对象 |
+|---|---|---:|---:|---:|---|
+| AFD | 2A2F | 2 | 2 | 4 | 4 卡普通混步 |
+| AFD | 4A2F | 4 | 2 | 6 | 6 卡普通混步 |
+| AFD | 6A2F | 6 | 2 | 8 | 8 卡普通混步 |
+| 普通混步 | 4card | - | - | 4 | 2A2F |
+| 普通混步 | 6card | - | - | 6 | 4A2F |
+| 普通混步 | 8card | - | - | 8 | 6A2F |
 
-| topology | Attention ranks | FFN ranks | A/F | ISL | OSL | concurrency | request count | measured repeats |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2A2F | 2 | 2 | 1 | 2048 | 128 | 128 | 2048 | 3 |
-| 2A2F | 2 | 2 | 1 | 32768 | 128 | 128 | 2048 | 3 |
-| 4A2F | 4 | 2 | 2 | 2048 | 128 | 128 | 2048 | 3 |
-| 4A2F | 4 | 2 | 2 | 32768 | 128 | 128 | 2048 | 3 |
-| 6A2F | 6 | 2 | 3 | 2048 | 128 | 128 | 2048 | 3 |
-| 6A2F | 6 | 2 | 3 | 32768 | 128 | 128 | 2048 | 3 |
+只允许等总卡数比较：
 
-这里的 `2K/32K` 明确定义为 `synthetic_config.py` 中的输入长度（ISL），不是输入加输出的总长度。所有组固定 `OSL=128`、并发 `128`、请求数 `2048`，否则各组数据不可直接比较。
+- `2A2F vs 4card mix`
+- `4A2F vs 6card mix`
+- `6A2F vs 8card mix`
 
-AISBench 如果同时输出多种吞吐量，必须全部保留：
+不得用 2A2F 与 6 卡或 8 卡混步比较。
 
-- Output token throughput，作为主图优先候选
-- Total token throughput
-- Request throughput
-- Input token throughput（如果工具输出）
-- TTFT、TPOT、ITL 等时延指标（如果工具输出）
-
-不要在绿区自行猜测字段含义或手工换算。用户把所需日志文本手动提供给蓝区后，再由蓝区确定最终纵坐标。
-
-## 2. 严格执行原则
-
-1. 不修改 AFD、vLLM、vllm-ascend 源码，不切分支，不拉取新提交。
-2. 不更换模型、编译参数、采样参数或并发数。
-3. 不用 `pkill -f vllm` 等宽范围命令。只停止本次启动时记录的 PID。
-4. 每个 topology 先启动 FFN，再启动 Attention；只向 Attention 端口压测。
-5. 每个 topology 只启动一次服务，依次执行 2K 和 32K，保证两种上下文使用相同的服务参数。
-6. 每个上下文先 warm-up，再执行 3 次正式测量；warm-up 不计入结果。
-7. 任何一组失败都不得伪造、补齐或丢弃日志。停止当前阶段并按第 10 节在绿区对话中报告。
-8. 禁止从绿区执行 `git push`、`scp`、`curl` 上传或其他向蓝区传输文件的操作。所有产物只保存在绿区本机，跨区传递由用户按允许的方式手动完成。
-
-## 3. 当前方案中的硬停止条件
-
-满足任意一项时停止压测，只在绿区对话中输出检查结果：
-
-- `npu-smi info` 看不到至少 8 张可用 NPU。`6A2F` 单机需要 8 张卡。
-- 模型不支持至少 `32768 + 128 = 32896` tokens 的输入加输出长度。
-- `18000`、`18010` 或 `6239` 被无关进程占用。
-- A/F 两个进程没有按预期绑定到互不重叠的设备。
-- 服务日志出现 NPU 错误、OOM、connector 初始化失败或进程退出。
-- API 健康检查未通过。
-
-## 4. 结果目录
-
-在绿区创建独立目录，不覆盖以前的结果：
-
-```bash
-export PERF_RUN_ID="$(date +%Y%m%d_%H%M%S)"
-export PERF_ROOT="/home/s00988495/outputs/afd_deepseek_v4_perf/${PERF_RUN_ID}"
-mkdir -p "${PERF_ROOT}"/{env,serve_scripts,runs}
-printf '%s\n' "${PERF_ROOT}" | tee "${PERF_ROOT}/RESULT_PATH.txt"
-```
-
-后续所有日志、PID、配置快照和结果都必须写入 `${PERF_ROOT}`。
-
-## 5. Phase 0：只做环境检查
-
-先执行以下检查，不启动压测：
-
-```bash
-set -o pipefail
-
-date -Ins | tee "${PERF_ROOT}/env/date.txt"
-uname -a | tee "${PERF_ROOT}/env/uname.txt"
-npu-smi info | tee "${PERF_ROOT}/env/npu_smi_before.txt"
-python3 --version 2>&1 | tee "${PERF_ROOT}/env/python_version.txt"
-vllm --version 2>&1 | tee "${PERF_ROOT}/env/vllm_version.txt"
-ais_bench --help >/dev/null 2>&1
-printf 'ais_bench_rc=%s\n' "$?" | tee "${PERF_ROOT}/env/aisbench_check.txt"
-ss -ltnp | grep -E ':(18000|18010|6239)\b' | tee "${PERF_ROOT}/env/ports_before.txt" || true
-df -h /home/s00988495 /mnt/weight | tee "${PERF_ROOT}/env/disk.txt"
-```
-
-记录已安装 Python 包版本，不要执行升级：
-
-```bash
-python3 - <<'PY' | tee "${PERF_ROOT}/env/python_packages.txt"
-from importlib.metadata import PackageNotFoundError, version
-
-for name in ("vllm", "vllm-ascend", "afd-plugin", "ais-bench-benchmark"):
-    try:
-        print(f"{name}={version(name)}")
-    except PackageNotFoundError:
-        print(f"{name}=NOT_INSTALLED_AS_DISTRIBUTION")
-PY
-```
-
-记录 AFD 仓库状态，不修改工作区：
-
-```bash
-git -C /home/s00988495/AFD rev-parse HEAD 2>&1 | tee "${PERF_ROOT}/env/afd_commit.txt"
-git -C /home/s00988495/AFD status --short 2>&1 | tee "${PERF_ROOT}/env/afd_status.txt"
-```
-
-检查模型声明的最大长度：
-
-```bash
-python3 - <<'PY' | tee "${PERF_ROOT}/env/model_context.txt"
-import json
-from pathlib import Path
-
-path = Path("/mnt/weight/A5-weights/DeepSeek-V4-Flash/config.json")
-data = json.loads(path.read_text(encoding="utf-8"))
-print(f"config={path}")
-for key in (
-    "max_position_embeddings",
-    "model_max_length",
-    "seq_length",
-    "max_sequence_length",
-):
-    print(f"{key}={data.get(key)!r}")
-PY
-```
-
-如果已知最大长度小于 `32896`，立即停止并在绿区对话中报告。不要为了让 32K 跑起来而擅自修改模型 `config.json`。
-
-## 6. Phase 1：生成三组服务脚本
-
-不要直接编辑原始 `/home/s00988495/afd_serve_A.sh` 和 `afd_serve_F.sh`。复制到 `${PERF_ROOT}/serve_scripts` 后制作三组脚本：
-
-| topology | `ATTN_DEVICES` | `FFN_DEVICES` | Attention `--data-parallel-size` | FFN `--data-parallel-size` | `num_attention_ranks` | `num_ffn_ranks` |
-|---|---|---|---:|---:|---:|---:|
-| 2A2F | `0,1` | `2,3` | 2 | 2 | 2 | 2 |
-| 4A2F | `0,1,2,3` | `4,5` | 4 | 2 | 4 | 2 |
-| 6A2F | `0,1,2,3,4,5` | `6,7` | 6 | 2 | 6 | 2 |
-
-三组脚本必须保持以下参数完全相同：
+### 1.2 固定参数
 
 ```text
 MODEL_PATH=/mnt/weight/A5-weights/DeepSeek-V4-Flash
 SERVED_MODEL_NAME=DeepSeek-V4-Flash
-ATTN_PORT=18000
-FFN_PORT=18010
-AFD_HOST=127.0.0.1
-AFD_PORT=6239
-MAX_MODEL_LEN=33792
-tensor-parallel-size=1
-enable-expert-parallel=true
-compilation-config={"cudagraph_capture_sizes":[8],"cudagraph_mode":"FULL_DECODE_ONLY"}
+MAX_MODEL_LEN=32768
+MAX_NUM_SEQS=256
+BS_LIST=(32 64 128 256)
+CUDAGRAPH_CAPTURE_SIZES=(32 64 128 256)
+WARMUPS=1
 ```
 
-`MAX_MODEL_LEN=33792` 必须对 2K 和 32K 都保持一致。它大于 `32768+128`，并避免因为两种上下文使用不同服务容量而引入额外变量。
-
-用户提供的 2A2F 脚本只用于说明 MANF 的启动方法，其中关于旧机器设备能力的注释不适用于当前新机器。判断 topology 只看 `data-parallel-size`、实际设备数和 `num_*_ranks`，三者必须一致。
-
-### 6.1 修正 additional-config 的 shell 引号
-
-派生脚本不要继续使用下面这种不可靠的嵌套引号：
-
-```bash
---additional-config "{"afd":{...}}"
-```
-
-在 Attention 脚本中先构造变量，再传给 vLLM：
-
-```bash
-AFD_CONFIG="$(printf '{\"afd\":{\"role\":\"attention\",\"connector\":\"CAMP2pAFDConnector\",\"host\":\"%s\",\"port\":%s,\"num_attention_ranks\":%s,\"num_ffn_ranks\":%s}}' \
-    "$AFD_HOST" "$AFD_PORT" "$ATTN_RANKS" "$FFN_RANKS")"
-
-# vllm serve 的最后一个参数：
---additional-config "$AFD_CONFIG"
-```
-
-FFN 脚本只把 role 改成 `ffn`：
-
-```bash
-AFD_CONFIG="$(printf '{\"afd\":{\"role\":\"ffn\",\"connector\":\"CAMP2pAFDConnector\",\"host\":\"%s\",\"port\":%s,\"num_attention_ranks\":%s,\"num_ffn_ranks\":%s}}' \
-    "$AFD_HOST" "$AFD_PORT" "$ATTN_RANKS" "$FFN_RANKS")"
-```
-
-每个脚本必须显式定义 `ATTN_RANKS` 和 `FFN_RANKS`，数值取上表。生成后检查：
-
-```bash
-bash -n "${PERF_ROOT}"/serve_scripts/*.sh
-grep -nE 'DEVICES|RANKS|data-parallel|max-model-len|additional-config' \
-    "${PERF_ROOT}"/serve_scripts/*.sh \
-    | tee "${PERF_ROOT}/env/generated_serve_parameters.txt"
-```
-
-如果 `bash -n` 失败，停止并在绿区对话中打印脚本路径和错误；由用户手动把信息复制给蓝区。
-
-## 7. Phase 2：逐个 topology 启动服务
-
-执行顺序固定为 `2A2F -> 4A2F -> 6A2F`。同一时刻只能运行一组。
-
-以下用 `${TOPOLOGY}` 代表当前组，并假定脚本名为：
+必须使用图模式：
 
 ```text
-${PERF_ROOT}/serve_scripts/afd_serve_F_${TOPOLOGY}.sh
-${PERF_ROOT}/serve_scripts/afd_serve_A_${TOPOLOGY}.sh
+--compilation-config '{"cudagraph_capture_sizes":[32,64,128,256],"cudagraph_mode":"FULL_DECODE_ONLY"}'
 ```
 
-为当前组创建目录并先启动 FFN：
-
-```bash
-export TOPOLOGY="2A2F"  # 后续依次改成 4A2F、6A2F
-export TOPO_ROOT="${PERF_ROOT}/runs/${TOPOLOGY}"
-mkdir -p "${TOPO_ROOT}"/{service,2K,32K}
-
-nohup bash "${PERF_ROOT}/serve_scripts/afd_serve_F_${TOPOLOGY}.sh" \
-    >"${TOPO_ROOT}/service/ffn.log" 2>&1 &
-echo $! >"${TOPO_ROOT}/service/ffn.pid"
-sleep 10
-kill -0 "$(cat "${TOPO_ROOT}/service/ffn.pid")"
-```
-
-FFN 进程仍存活后，再启动 Attention：
-
-```bash
-nohup bash "${PERF_ROOT}/serve_scripts/afd_serve_A_${TOPOLOGY}.sh" \
-    >"${TOPO_ROOT}/service/attention.log" 2>&1 &
-echo $! >"${TOPO_ROOT}/service/attention.pid"
-```
-
-等待 API，最多等待 30 分钟：
-
-```bash
-ready=0
-for i in $(seq 1 180); do
-    if ! kill -0 "$(cat "${TOPO_ROOT}/service/ffn.pid")" 2>/dev/null; then
-        break
-    fi
-    if ! kill -0 "$(cat "${TOPO_ROOT}/service/attention.pid")" 2>/dev/null; then
-        break
-    fi
-    if curl -fsS http://127.0.0.1:18000/v1/models \
-        >"${TOPO_ROOT}/service/models.json" 2>/dev/null; then
-        ready=1
-        break
-    fi
-    sleep 10
-done
-
-if [[ "$ready" != 1 ]]; then
-    echo "SERVICE_NOT_READY"
-    tail -n 200 "${TOPO_ROOT}/service/ffn.log"
-    tail -n 200 "${TOPO_ROOT}/service/attention.log"
-    exit 1
-fi
-```
-
-服务就绪后保存状态：
-
-```bash
-npu-smi info | tee "${TOPO_ROOT}/service/npu_smi_ready.txt"
-ss -ltnp | grep -E ':(18000|18010|6239)\b' \
-    | tee "${TOPO_ROOT}/service/ports_ready.txt" || true
-```
-
-任一 topology 如果实际启动失败，直接执行第 10 节的失败报告，不进入 AISBench。
-
-## 8. Phase 3：AISBench warm-up 和正式测量
-
-使用仓库中已有的脚本：
+禁止添加：
 
 ```text
-/home/s00988495/tools/utils-/aisbench_synthetic_gen.sh
+--enforce-eager
 ```
 
-其参数顺序是：
+### 1.3 Batch Size 和数据量
+
+本实验的 Batch Size 只指 AisBench benchmark config 中的 `batchsize`。
+
+它不等于：
+
+- `--max-num-batched-tokens`
+- `--num-prompts`
+- A/F rank 数
+- DP 数量
+
+每个测试点固定：
 
 ```text
-模型路径 模型名 API端口 输入长度 输出长度 并发数 请求数
+dataset_size = batchsize × 4
 ```
 
-### 8.1 每种上下文先 warm-up
+| batchsize | dataset size |
+|---:|---:|
+| 32 | 128 |
+| 64 | 256 |
+| 128 | 512 |
+| 256 | 1024 |
 
-2K warm-up：
-
-```bash
-bash /home/s00988495/tools/utils-/aisbench_synthetic_gen.sh \
-    /mnt/weight/A5-weights/DeepSeek-V4-Flash \
-    DeepSeek-V4-Flash 18000 2048 128 8 32 \
-    2>&1 | tee "${TOPO_ROOT}/2K/warmup.log"
-```
-
-32K warm-up：
-
-```bash
-bash /home/s00988495/tools/utils-/aisbench_synthetic_gen.sh \
-    /mnt/weight/A5-weights/DeepSeek-V4-Flash \
-    DeepSeek-V4-Flash 18000 32768 128 8 32 \
-    2>&1 | tee "${TOPO_ROOT}/32K/warmup.log"
-```
-
-必须先执行 `set -o pipefail`，这样 AISBench 失败时不会被 `tee` 掩盖。warm-up 失败即停止，不进行正式测试。
-
-### 8.2 每种上下文正式执行 3 次
-
-2K：
-
-```bash
-for repeat in 1 2 3; do
-    bash /home/s00988495/tools/utils-/aisbench_synthetic_gen.sh \
-        /mnt/weight/A5-weights/DeepSeek-V4-Flash \
-        DeepSeek-V4-Flash 18000 2048 128 128 2048 \
-        2>&1 | tee "${TOPO_ROOT}/2K/repeat_${repeat}.log"
-done
-```
-
-32K：
-
-```bash
-for repeat in 1 2 3; do
-    bash /home/s00988495/tools/utils-/aisbench_synthetic_gen.sh \
-        /mnt/weight/A5-weights/DeepSeek-V4-Flash \
-        DeepSeek-V4-Flash 18000 32768 128 128 2048 \
-        2>&1 | tee "${TOPO_ROOT}/32K/repeat_${repeat}.log"
-done
-```
-
-每次运行后检查命令返回码、A/F 进程是否还活着，以及日志中是否有 `ERROR`、`Traceback` 或 `OOM`。任意异常都停止当前 topology。
-
-### 8.3 保存 AISBench 实际生成的配置
-
-`aisbench_synthetic_gen.sh` 每次会重写已安装包中的配置，因此每种上下文结束后都要复制快照：
-
-```bash
-PACKAGE_DIR="$(python3 -c 'import pathlib, ais_bench; print(pathlib.Path(ais_bench.__file__).resolve().parent)')"
-
-cp -a "${PACKAGE_DIR}/datasets/synthetic/synthetic_config.py" \
-    "${TOPO_ROOT}/32K/synthetic_config.py"
-cp -a "${PACKAGE_DIR}/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py" \
-    "${TOPO_ROOT}/32K/vllm_api_stream_chat.py"
-```
-
-2K 测试结束时同样复制到 `${TOPO_ROOT}/2K/`，不要等 32K 执行后再复制，否则 2K 配置会被覆盖。
-
-## 9. Phase 4：安全停止当前 topology
-
-完成当前 topology 后，只停止记录在 PID 文件中的两个进程：
-
-```bash
-for role in attention ffn; do
-    pid_file="${TOPO_ROOT}/service/${role}.pid"
-    if [[ -s "$pid_file" ]]; then
-        pid="$(cat "$pid_file")"
-        kill "$pid" 2>/dev/null || true
-    fi
-done
-
-for i in $(seq 1 30); do
-    alive=0
-    for role in attention ffn; do
-        pid_file="${TOPO_ROOT}/service/${role}.pid"
-        if [[ -s "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-            alive=1
-        fi
-    done
-    [[ "$alive" == 0 ]] && break
-    sleep 1
-done
-
-npu-smi info | tee "${TOPO_ROOT}/service/npu_smi_after_stop.txt"
-```
-
-如果 30 秒后进程仍未退出，记录 PID 和日志并在绿区对话中报告，不要执行宽范围 `pkill`。
-
-## 10. 失败时如何在绿区报告
-
-失败后不要尝试修改源码，也不要尝试向蓝区 push 或传文件。绿区 Agent 应在当前绿区对话中直接输出以下信息，用户再手动复制给蓝区 Agent：
-
-1. 失败阶段：环境检查、服务生成、FFN 启动、Attention 启动、2K warm-up、2K repeat N、32K warm-up 或 32K repeat N。
-2. topology、ISL、OSL、并发和请求数。
-3. 失败命令原文和退出码。
-4. `${PERF_ROOT}` 完整路径。
-5. A/F 日志最后 200 行。
-6. AISBench 日志最后 200 行（如果已经进入压测）。
-7. `npu-smi info` 和端口占用。
-
-如果用户后续需要完整文件，可以在绿区本机生成压缩包。这个命令只生成本地文件，不上传、不 push，也不会自动进入蓝区：
-
-```bash
-tar -C "$(dirname "${PERF_ROOT}")" \
-    -czf "${PERF_ROOT}.tar.gz" \
-    "$(basename "${PERF_ROOT}")"
-printf 'RESULT_ARCHIVE=%s.tar.gz\n' "${PERF_ROOT}"
-```
-
-蓝区无法直接访问这里打印的绿区路径。路径只是方便用户在绿区查找文件；是否以及如何跨区取走文件，由用户按公司允许的流程手动处理。
-
-不得把 API Key、Claude settings、环境变量全集或其他凭据放进日志和压缩包。不得执行 `git add`、`git commit` 或 `git push` 提交测试产物。
-
-## 11. 成功时交付内容
-
-绿区不负责画最终曲线，只交付可复现原始数据。成功后应包含：
-
-- 环境与版本信息
-- 三组实际使用的 A/F 启动脚本
-- 每个 topology 的 A/F 完整日志
-- 每个 ISL 的 warm-up 日志和 3 份正式日志
-- 每个 ISL 实际生成的 `synthetic_config.py`
-- 实际生成的 `vllm_api_stream_chat.py`
-- 开始前、服务就绪后、停止后的 `npu-smi` 信息
-
-最终图由蓝区制作：
-
-- x 轴数值：`1, 2, 3`
-- x 轴标签：`2A2F, 4A2F, 6A2F`
-- 2K 和 32K 各一条曲线
-- 每个点取 3 次正式测量的中位数
-- 同时保留 3 个原始点，用于判断抖动和异常值
-
-## 12. 发给绿区 Agent 的提示词
-
-把本文件同步到绿区后，将下面内容直接发给绿区 Agent：
+同时必须满足：
 
 ```text
-阅读 afd_deepseek_v4_perf_green_runbook.md，并严格按文档执行。
+batchsize <= --max-num-seqs
+batchsize in cudagraph_capture_sizes
+```
 
-你的职责只是执行、在绿区本机完整保存日志，并在当前绿区对话中报告结果。不要修改 AFD、vLLM、vllm-ascend 源码，不要切换版本，不要自行调整测试参数，也不要隐瞒失败。
+本轮主矩阵不包含 BS=512。只有完成全部 24 个测试点且蓝区确认后，才能扩展到 512；扩展时必须同步提高 `--max-num-seqs` 并把 512 加入 capture sizes。
 
-先执行 Phase 0 环境检查。若命中任何硬停止条件，立即停止并按第 10 节在当前对话中输出报告。检查通过后，按 2A2F、4A2F、6A2F 顺序执行。每个 topology 先 F 后 A，只向 Attention 的 18000 端口压测。每种上下文先 warm-up，再执行 3 次正式测量。
+### 1.4 32K 的含义
 
-如果出现 NPU 错误、OOM、connector 错误、服务进程退出、API 不可用或 AISBench 非零退出，停止当前阶段，在绿区保留原始文件，并在当前对话中打印错误摘要、日志最后 200 行和 PERF_ROOT。不要擅自修复，不要执行 git push、scp、curl 上传或其他跨区传输操作；用户会手动把必要文本提供给蓝区。
+AFD 和普通混步服务统一使用：
+
+```text
+--max-model-len 32768
+```
+
+注意：`--max-model-len` 是服务容量上限，不会自动把请求变成 32K。绿区必须定位并复用已经跑通的 32K dataset 配置，记录其中实际 ISL、OSL 和生成参数，并保证：
+
+```text
+ISL + OSL <= 32768
+```
+
+不得在 OSL 大于 0 时把 synthetic Input 直接设置成 32768。若当前没有已经确认的 32K dataset 配置，停止在 Phase 0，打印找到的 dataset schema 和候选配置，由蓝区决定 ISL/OSL；不要自行发明长度。
+
+## 2. 与旧执行手册的差异
+
+本轮不得沿用以下旧口径：
+
+- 不再测试 2K。
+- 不把并发固定为 128，而是扫描 32、64、128、256。
+- 不把请求数固定为 2048，而是严格使用 `4 × batchsize`。
+- 不使用 `--num-prompts` 控制正式测试数据量。
+- 不使用 `ais_bench --models ... --datasets ... --mode perf`。
+- 不直接使用当前仓库中的 `aisbench_synthetic_gen.sh` 跑本轮实验；该脚本属于旧 CLI 流程。
+- 不额外手写一轮 warmup 请求；使用 AisBench 的 `--num-warmups 1`。
+- 不再使用 `MAX_MODEL_LEN=33792`。
+- 不再使用只包含 `[8]` 的 `cudagraph_capture_sizes`。
+
+## 3. 实验矩阵
+
+必须完成 6 种运行配置 × 4 个 batchsize，共 24 个测试点：
+
+| mode | topology | BS |
+|---|---|---|
+| AFD | 2A2F | 32 / 64 / 128 / 256 |
+| mix | 4card | 32 / 64 / 128 / 256 |
+| AFD | 4A2F | 32 / 64 / 128 / 256 |
+| mix | 6card | 32 / 64 / 128 / 256 |
+| AFD | 6A2F | 32 / 64 / 128 / 256 |
+| mix | 8card | 32 / 64 / 128 / 256 |
+
+正式全量测试前，必须先完成唯一的 smoke test：
+
+```text
+AFD 4A2F + BS=32 + dataset_size=128
+```
+
+smoke test 失败时不得进入其余 23 个测试点。
+
+## 4. 执行边界
+
+1. 不修改 vLLM、vLLM-Ascend 或 afd-plugin 源码。
+2. 不切换 Git 分支或提交，不运行 `git pull`。
+3. 先理解现有可运行的 4A2F 脚本，再生成其他服务脚本。
+4. 不仅凭参数名猜测 DP、EP、TP、rank 和物理卡之间的关系。
+5. AisBench schema、字段名和 CLI 以当前环境中的 `ais_bench -h` 与已跑通 config 为准。
+6. 所有测试点必须保存独立 config、dataset、服务日志和 work directory。
+7. 不使用宽范围 `pkill -f vllm`。只停止本次记录的 PID。
+8. 不从绿区执行 Git push、scp、curl 外传或其他跨区传输。
+9. 不在日志中输出 API Key、Claude settings 或环境变量全集。
+
+## 5. 目录结构
+
+在绿区建立独立测试目录：
+
+```text
+/home/s00988495/perf_test/
+├── afd/
+│   ├── 2A2F/
+│   │   ├── serve_A.sh
+│   │   └── serve_F.sh
+│   ├── 4A2F/
+│   │   ├── serve_A.sh
+│   │   └── serve_F.sh
+│   └── 6A2F/
+│       ├── serve_A.sh
+│       └── serve_F.sh
+├── mix/
+│   ├── serve_4card.sh
+│   ├── serve_6card.sh
+│   └── serve_8card.sh
+├── aisbench/
+│   ├── baseline/
+│   ├── configs/
+│   └── datasets/
+├── scripts/
+│   ├── run_one.sh
+│   └── run_all.sh
+├── env/
+├── logs/
+├── results/
+├── summary/
+└── README.md
+```
+
+不得覆盖旧测试结果。正式执行时再增加 run ID：
+
+```bash
+export PERF_ROOT=/home/s00988495/perf_test
+export RUN_ID="$(date +%Y%m%d_%H%M%S)"
+export RUN_ROOT="${PERF_ROOT}/results/${RUN_ID}"
+mkdir -p "${RUN_ROOT}"
+```
+
+## 6. Phase 0：只扫描，不生成、不压测
+
+### 6.1 保存环境信息
+
+```bash
+export PERF_ROOT=/home/s00988495/perf_test
+mkdir -p "${PERF_ROOT}"/{env,afd,mix,aisbench/baseline,aisbench/configs,aisbench/datasets,scripts,logs,results,summary}
+
+date -Ins | tee "${PERF_ROOT}/env/date.txt"
+uname -a | tee "${PERF_ROOT}/env/uname.txt"
+npu-smi info | tee "${PERF_ROOT}/env/npu_smi.txt"
+python3 --version 2>&1 | tee "${PERF_ROOT}/env/python.txt"
+python3 -m pip list | grep -E '^(vllm|vllm-ascend|afd-plugin|ais)' \
+    | tee "${PERF_ROOT}/env/packages.txt" || true
+```
+
+保存三个源码仓库的 commit 和工作区状态：
+
+```bash
+for repo in vllm vllm-ascend afd-plugin; do
+    git -C "/home/s00988495/AFD/${repo}" rev-parse HEAD \
+        | tee "${PERF_ROOT}/env/${repo}_commit.txt"
+    git -C "/home/s00988495/AFD/${repo}" status --short \
+        | tee "${PERF_ROOT}/env/${repo}_status.txt"
+done
+```
+
+### 6.2 确认 AisBench 当前 CLI
+
+必须实际执行，不凭记忆：
+
+```bash
+command -v ais_bench | tee "${PERF_ROOT}/env/aisbench_path.txt"
+ais_bench -h 2>&1 | tee "${PERF_ROOT}/env/aisbench_help.txt"
+```
+
+确认当前版本支持：
+
+```text
+ais_bench CONFIG
+-m perf
+-w WORK_DIR
+--num-warmups 1
+```
+
+若任一参数不受当前版本支持，停止并把完整 `ais_bench -h` 输出打印给用户，不要换回旧 CLI。
+
+### 6.3 定位已有 AisBench 配置
+
+首先定位安装目录：
+
+```bash
+python3 - <<'PY' | tee "${PERF_ROOT}/env/aisbench_package_path.txt"
+import pathlib
+import ais_bench
+
+print(pathlib.Path(ais_bench.__file__).resolve().parent)
+PY
+```
+
+然后搜索当前已有的配置，重点找已经成功运行过的文件：
+
+```bash
+find /home/s00988495 /root -type f \
+    \( -name '*.yaml' -o -name '*.yml' -o -name '*.py' \) \
+    2>/dev/null \
+    | grep -Ei 'ais|bench|synthetic|dataset|summar|vllm' \
+    | tee "${PERF_ROOT}/env/aisbench_config_candidates.txt"
+```
+
+在候选文件中定位并记录：
+
+- benchmark config 入口
+- `batchsize` 字段
+- model config 与服务地址
+- dataset config 与实际请求数量字段
+- 32K workload 的 ISL、OSL 和生成参数
+- summarizer config
+- 结果输出结构
+
+将已跑通的原始 config 和 dataset 原样复制到 `${PERF_ROOT}/aisbench/baseline/`。不要修改安装包内的唯一原件。
+
+### 6.4 定位当前可运行的 4A2F 脚本和日志
+
+优先检查：
+
+```text
+/home/s00988495/afd_serve_A.sh
+/home/s00988495/afd_serve_F.sh
+```
+
+复制到：
+
+```text
+/home/s00988495/perf_test/afd/4A2F/serve_A.sh
+/home/s00988495/perf_test/afd/4A2F/serve_F.sh
+```
+
+同时定位最近一次成功启动日志。禁止在尚未理解 4A2F 时直接生成 2A2F/6A2F。
+
+### 6.5 Phase 0 交付与闸门
+
+生成 `${PERF_ROOT}/env/phase0_report.md`，至少写明：
+
+- AisBench 真实命令和版本
+- 已跑通 benchmark config 路径
+- `batchsize` 的配置位置
+- dataset 数量字段及配置路径
+- 32K workload 的 ISL/OSL
+- 当前 4A2F 两个脚本路径
+- 当前 4A2F 的设备、DP、TP、EP、A/F rank 和端口
+- 普通混步是否已有可运行基线脚本
+- 所有未确认项
+
+存在任何未确认项时停止。绿区 Agent 在当前对话中粘贴 `phase0_report.md`，由用户手动带给蓝区；不能自行猜测后继续。
+
+## 7. Phase 1：确认 4A2F 架构并派生服务脚本
+
+### 7.1 必须确认的关系
+
+结合现有 4A2F 脚本、afd-plugin 源码、vllm-ascend 源码和成功启动日志，解释：
+
+- `ASCEND_RT_VISIBLE_DEVICES`
+- `--data-parallel-size`
+- `--tensor-parallel-size`
+- `--enable-expert-parallel`
+- `num_attention_ranks`
+- `num_ffn_ranks`
+- A2E/E2A connector
+- 每个 rank 与物理卡的映射
+
+只有确认 4A2F 的实际映射后，才允许按相同规律派生其他拓扑。
+
+### 7.2 AFD 目标设备布局
+
+下表是待验证的目标布局，不是跳过源码/日志验证的依据：
+
+| topology | Attention devices | FFN devices | A ranks | F ranks | total cards |
+|---|---|---|---:|---:|---:|
+| 2A2F | `0,1` | `2,3` | 2 | 2 | 4 |
+| 4A2F | `0,1,2,3` | `4,5` | 4 | 2 | 6 |
+| 6A2F | `0,1,2,3,4,5` | `6,7` | 6 | 2 | 8 |
+
+AFD 约束必须成立：
+
+```text
+A >= F
+A % F == 0
+F = 2
+```
+
+4A2F 是已知基线，不重新设计；只在副本中补齐本轮统一的服务参数。
+
+### 7.3 普通混步目标布局
+
+| topology | visible devices | total cards |
+|---|---|---:|
+| 4card | `0,1,2,3` | 4 |
+| 6card | `0,1,2,3,4,5` | 6 |
+| 8card | `0,1,2,3,4,5,6,7` | 8 |
+
+普通混步使用单个 vLLM 服务，不配置 AFD role、A2E/E2A connector 或 A/F rank。DP/EP/TP 必须根据当前 DeepSeek-V4-Flash 在 vLLM-Ascend 上已经验证的普通混步启动方式确定；若没有已跑通的混步基线，先生成候选配置并把依据返回蓝区，不得直接把候选数据当正式结果。
+
+### 7.4 所有服务脚本的统一约束
+
+AFD 与 mix 均必须包含：
+
+```text
+--max-model-len 32768
+--max-num-seqs 256
+--compilation-config {"cudagraph_capture_sizes":[32,64,128,256],"cudagraph_mode":"FULL_DECODE_ONLY"}
+```
+
+均不得包含：
+
+```text
+--enforce-eager
+```
+
+AFD 两个角色均保存独立日志；先启动 F，再启动 A；只向 Attention API 发送请求。普通混步只启动一个服务。
+
+生成脚本后执行：
+
+```bash
+bash -n "${PERF_ROOT}"/afd/*/*.sh
+bash -n "${PERF_ROOT}"/mix/*.sh
+
+grep -RInE 'max-model-len|max-num-seqs|cudagraph_capture_sizes|enforce-eager|data-parallel|tensor-parallel|num_attention_ranks|num_ffn_ranks' \
+    "${PERF_ROOT}/afd" "${PERF_ROOT}/mix" \
+    | tee "${PERF_ROOT}/env/service_parameter_audit.txt"
+```
+
+若出现 `--enforce-eager`、缺少 256、capture sizes 不完整或卡数不匹配，停止。
+
+## 8. Phase 2：生成每个测试点的 AisBench 配置
+
+### 8.1 唯一正式命令形式
+
+正式测试必须使用：
+
+```bash
+ais_bench "${BENCHMARK_CONFIG}" \
+    -m perf \
+    --num-warmups 1 \
+    -w "${WORK_DIR}"
+```
+
+不要使用：
+
+```text
+--models
+--datasets
+--mode perf
+--num-prompts
+```
+
+### 8.2 配置生成原则
+
+每个测试点从 Phase 0 找到的“已跑通 config”复制生成，不能从空文件猜 schema。
+
+例如：
+
+```text
+perf_test/aisbench/configs/afd_4a2f_bs128.yaml
+perf_test/aisbench/datasets/afd_4a2f_bs128.*
+```
+
+每个点只按当前 config 的真实 schema 修改：
+
+1. `batchsize=BS`
+2. dataset 请求数量设置为 `BS × 4`
+3. 服务地址指向当前服务端口
+4. model 名称保持 `DeepSeek-V4-Flash`
+5. 复用同一个已确认的 32K workload 参数
+6. 复用相同采样参数和 summarizer
+
+如果 config 中找不到明确的 `batchsize` 字段，停止并返回 config 内容；不要用 `batch_size`、`--num-prompts` 或其他字段替代。
+
+### 8.3 生成后检查
+
+`run_one.sh` 必须在调用 AisBench 前输出并保存：
+
+```text
+mode
+topology
+batchsize
+dataset_size
+benchmark_config
+dataset_config
+service endpoint
+max_model_len
+max_num_seqs
+cudagraph_capture_sizes
+```
+
+并验证：
+
+```text
+dataset_size == batchsize × 4
+batchsize <= 256
+batchsize ∈ [32,64,128,256]
+```
+
+还必须从当前服务脚本中确认：
+
+```text
+--max-num-seqs >= batchsize
+cudagraph_capture_sizes 包含 batchsize
+```
+
+任何检查失败都禁止启动正式测试。
+
+## 9. Phase 3：自动化脚本契约
+
+### 9.1 run_one.sh
+
+接口：
+
+```bash
+bash run_one.sh afd 4A2F 128
+bash run_one.sh mix 6card 128
+```
+
+`run_one.sh` 必须按顺序完成：
+
+1. 校验 mode、topology、总卡数和 batchsize。
+2. 计算 `dataset_size=$((batchsize * 4))`。
+3. 复制基线 AisBench config/dataset，生成当前测试点专用副本。
+4. 修改 config 中的 `batchsize`。
+5. 修改 dataset 配置中的请求数量。
+6. 校验 `max-num-seqs` 和 capture sizes。
+7. 创建独立的 log/result/work 目录。
+8. AFD 模式先启动 F，再启动 A；mix 模式启动单服务。
+9. 记录服务 PID，不使用宽范围 pkill。
+10. 轮询 `/v1/models`，等待服务 ready。
+11. 保存启动后的 `npu-smi info`。
+12. 执行一次 AisBench 正式命令，显式指定 `--num-warmups 1`。
+13. 保存 AisBench stdout/stderr、work directory 和服务日志。
+14. 检查服务日志中的 graph capture 与 graph replay 状态。
+15. 停止本次记录的 PID，确认端口释放。
+16. 写入当前测试点的 `manifest.txt` 和 `status.txt`。
+
+结果目录名称：
+
+```text
+results/RUN_ID/afd_2A2F_bs32/
+results/RUN_ID/afd_4A2F_bs128/
+results/RUN_ID/mix_8card_bs256/
+```
+
+每个目录至少包含：
+
+```text
+benchmark_config.yaml
+dataset config/data
+manifest.txt
+status.txt
+aisbench.log
+server_A.log / server_F.log
+或 mix_server.log
+npu_smi_before.txt
+npu_smi_after.txt
+AisBench work directory
+```
+
+### 9.2 run_all.sh
+
+固定：
+
+```bash
+BS_LIST=(32 64 128 256)
+```
+
+第一步只执行：
+
+```bash
+bash run_one.sh afd 4A2F 32
+```
+
+确认 smoke test 成功、dataset size 为 128、graph capture/replay 正常后，才遍历完整矩阵。
+
+建议完整顺序：
+
+```text
+2A2F → 4card mix
+4A2F → 6card mix
+6A2F → 8card mix
+```
+
+每种配置内部按：
+
+```text
+32 → 64 → 128 → 256
+```
+
+任一测试点失败时停止 `run_all.sh`，不要跳过后继续，也不要产生伪造的空结果。
+
+## 10. 服务就绪、图模式和清理检查
+
+### 10.1 服务就绪
+
+最多等待 30 分钟，必须同时满足：
+
+- 本次记录的服务 PID 存活
+- API `/v1/models` 返回成功
+- 日志没有 OOM、Traceback、NPU error 或 connector error
+
+AFD 的请求只发送到 Attention 服务。
+
+### 10.2 图模式
+
+每个测试点必须从日志确认：
+
+- 当前 BS 在 capture sizes 中
+- graph capture 成功
+- decode 实际进入 graph replay
+- 没有回退到 eager 的警告
+
+如果当前日志无法证明 graph replay，结果标记为 `INVALID_GRAPH_STATUS`，不得进入最终比较。
+
+### 10.3 清理
+
+只允许对 PID 文件记录的进程发送 `TERM`，等待退出并确认端口释放。若 30 秒后仍未退出，停止自动化并报告；不要执行 `pkill -f vllm`。
+
+## 11. 结果汇总
+
+每个测试点至少记录：
+
+```text
+mode
+topology
+A cards
+F cards
+total cards
+batchsize
+dataset size
+max-model-len
+max-num-seqs
+cudagraph_capture_sizes
+DP
+EP
+TP
+QPS
+throughput
+TTFT mean/P50/P90/P99
+TPOT mean/P50/P90/P99
+E2E latency
+peak NPU memory（若可得）
+NPU utilization（若可得）
+graph replay status
+OOM status
+result path
+```
+
+将数据写入绿区本机：
+
+```text
+perf_test/summary/raw_results.csv
+perf_test/summary/failures.csv
+```
+
+不得猜测或手工补齐 AisBench 未输出的指标；缺失值写 `NA`，并保留原始日志字段名。
+
+## 12. 甜点区与最终分析
+
+绿区先整理数据，不负责作最终结论。蓝区基于原始数据分别寻找：
+
+- 2A2F、4A2F、6A2F 的最佳 BS
+- 4card、6card、8card mix 的最佳 BS
+
+甜点区不能只看最大吞吐，还要观察 BS 增大后：
+
+- Throughput/QPS 收益是否变小
+- TTFT 是否明显恶化
+- TPOT 是否明显恶化
+- E2E latency 是否明显恶化
+- 是否出现 OOM、调度拥塞或 graph 回退
+
+最终至少生成以下比较：
+
+1. 每种运行配置的吞吐量 vs batchsize。
+2. 每种运行配置的时延 vs batchsize。
+3. AFD 与等卡 mix 在相同 BS 下的比较。
+4. AFD 与等卡 mix 各自甜点区的比较。
+5. A/F ratio `1 → 2 → 3` 的性能变化。
+6. Attention、FFN、A2E/E2A 通信、bubble 与 rank 负载不均的瓶颈分析。
+
+## 13. 失败时在绿区报告
+
+发生失败后停止当前自动化，不修改源码，不向蓝区传文件。绿区 Agent 在当前对话中打印：
+
+1. phase、mode、topology、batchsize、dataset size
+2. 失败命令和退出码
+3. 本地结果目录
+4. 服务日志最后 200 行
+5. AisBench 日志最后 200 行
+6. 当前 PID、端口和 `npu-smi info`
+7. 生成的 benchmark config 与 dataset 数量字段片段
+8. `status.txt` 内容
+
+可以在绿区本机生成压缩包供用户按允许的方式手动处理，但不得自动上传：
+
+```bash
+tar -C /home/s00988495 \
+    -czf "/home/s00988495/perf_test_${RUN_ID}.tar.gz" \
+    perf_test
+```
+
+## 14. 发给绿区 Agent 的提示词
+
+将本文件同步到绿区后，直接发送：
+
+```text
+阅读 afd_deepseek_v4_perf_green_runbook.md，并严格按文档分阶段执行。
+
+先只执行 Phase 0：扫描当前 vLLM、vLLM-Ascend、afd-plugin、AisBench、已跑通的 AisBench config/dataset、当前可运行的 4A2F A/F 脚本及成功日志。生成 phase0_report.md 后停止，并在当前绿区对话中粘贴报告。不要在 Phase 0 直接生成拓扑或开始压测。
+
+蓝区确认 Phase 0 后，再分析 4A2F 的 device、DP、EP、TP、A/F rank 和 connector 映射，并以它为基线生成 2A2F、6A2F 以及等卡 4/6/8card 普通混步脚本。
+
+本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4。正式命令只能使用 ais_bench CONFIG -m perf --num-warmups 1 -w WORK_DIR，不使用 --num-prompts，也不使用旧的 --models/--datasets/--mode perf 流程。
+
+先执行 4A2F+BS32 smoke test，成功后再执行 24 个测试点。任何失败立即停止，在绿区保存原始文件，并在当前对话中打印错误摘要与日志尾部。不要修改源码，不要执行 git push、scp、curl 上传或其他跨区传输操作。
 ```
