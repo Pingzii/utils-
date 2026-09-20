@@ -28,14 +28,17 @@
 ### 1.2 固定参数
 
 ```text
-MODEL_PATH=/mnt/weight/A5-weights/DeepSeek-V4-Flash
-SERVED_MODEL_NAME=DeepSeek-V4-Flash
+MODEL_ID=DeepSeek-V4-Flash
+MIX_MODEL_PATH=/mnt/share/weight/DeepSeek-V4-Flash
+MIX_SERVED_MODEL_NAME=deepseek-v4
 MAX_MODEL_LEN=32768
 MAX_NUM_SEQS=256
 BS_LIST=(32 64 128 256)
 CUDAGRAPH_CAPTURE_SIZES=(32 64 128 256)
 WARMUPS=1
 ```
+
+普通混步必须使用已提供基线中的 `MIX_MODEL_PATH` 和 `MIX_SERVED_MODEL_NAME`。AFD 沿用已跑通 4A2F 脚本中的路径和服务名，但必须确认加载的是同一份 DeepSeek-V4-Flash 权重。AisBench 的 model 字段必须与当前被测服务的 `--served-model-name` 完全一致，不能对所有模式写死同一个名称。
 
 必须使用图模式：
 
@@ -96,7 +99,7 @@ AFD 和普通混步服务统一使用：
 ISL + OSL <= 32768
 ```
 
-不得在 OSL 大于 0 时把 synthetic Input 直接设置成 32768。若当前没有已经确认的 32K dataset 配置，停止在 Phase 0，打印找到的 dataset schema 和候选配置，由蓝区决定 ISL/OSL；不要自行发明长度。
+不得在 OSL 大于 0 时把 synthetic Input 直接设置成 32768。若当前没有已经确认的 32K dataset 配置，将其视为环境检查失败，打印找到的 dataset schema 和候选配置后停止；不要自行发明长度。
 
 ## 2. 与旧执行手册的差异
 
@@ -188,7 +191,9 @@ export RUN_ROOT="${PERF_ROOT}/results/${RUN_ID}"
 mkdir -p "${RUN_ROOT}"
 ```
 
-## 6. Phase 0：只扫描，不生成、不压测
+## 6. 步骤一：扫描环境与现有配置
+
+本步骤是整套自动执行流程的开头，不需要执行完后停下来等待蓝区确认。只要所有必要信息都能确认，立即继续生成脚本和运行测试；只有缺少必要配置或检查失败时才停止。
 
 ### 6.1 保存环境信息
 
@@ -288,9 +293,9 @@ find /home/s00988495 /root -type f \
 
 同时定位最近一次成功启动日志。禁止在尚未理解 4A2F 时直接生成 2A2F/6A2F。
 
-### 6.5 Phase 0 交付与闸门
+### 6.5 保存扫描记录并继续
 
-生成 `${PERF_ROOT}/env/phase0_report.md`，至少写明：
+生成 `${PERF_ROOT}/env/environment_report.md`，至少写明：
 
 - AisBench 真实命令和版本
 - 已跑通 benchmark config 路径
@@ -299,12 +304,12 @@ find /home/s00988495 /root -type f \
 - 32K workload 的 ISL/OSL
 - 当前 4A2F 两个脚本路径
 - 当前 4A2F 的设备、DP、TP、EP、A/F rank 和端口
-- 普通混步是否已有可运行基线脚本
+- 已提供普通混步基线的参数
 - 所有未确认项
 
-存在任何未确认项时停止。绿区 Agent 在当前对话中粘贴 `phase0_report.md`，由用户手动带给蓝区；不能自行猜测后继续。
+所有项目确认后立即继续步骤二，不等待用户或蓝区回复。存在未确认项时将其作为执行错误停止，并在绿区对话中打印 `environment_report.md`；不能自行猜测后继续。
 
-## 7. Phase 1：确认 4A2F 架构并派生服务脚本
+## 7. 步骤二：确认 4A2F 架构并生成全部服务脚本
 
 ### 7.1 必须确认的关系
 
@@ -343,13 +348,38 @@ F = 2
 
 ### 7.3 普通混步目标布局
 
-| topology | visible devices | total cards |
-|---|---|---:|
-| 4card | `0,1,2,3` | 4 |
-| 6card | `0,1,2,3,4,5` | 6 |
-| 8card | `0,1,2,3,4,5,6,7` | 8 |
+用户提供的 4 卡脚本是普通混步的唯一基线。其已确认结构是：
 
-普通混步使用单个 vLLM 服务，不配置 AFD role、A2E/E2A connector 或 A/F rank。DP/EP/TP 必须根据当前 DeepSeek-V4-Flash 在 vLLM-Ascend 上已经验证的普通混步启动方式确定；若没有已跑通的混步基线，先生成候选配置并把依据返回蓝区，不得直接把候选数据当正式结果。
+```text
+MODEL_PATH=/mnt/share/weight/DeepSeek-V4-Flash
+SERVED_MODEL_NAME=deepseek-v4
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+--data-parallel-size 4
+--tensor-parallel-size 1
+--enable-expert-parallel
+--host 127.0.0.1
+--port 18000
+```
+
+普通混步只运行一个 vLLM 服务，不配置 AFD role、A2E/E2A connector、A/F rank 或 `--additional-config`。基线脚本中的变量名 `ATTN_DEVICES` 只是历史命名，在混步中代表当前服务使用的全部设备。
+
+6 卡和 8 卡脚本必须直接以 4 卡脚本为模板类推，只改变可见设备和 DP：
+
+| topology | `ASCEND_RT_VISIBLE_DEVICES` | `--data-parallel-size` | TP | EP | total cards |
+|---|---|---:|---:|---|---:|
+| 4card | `0,1,2,3` | 4 | 1 | enabled | 4 |
+| 6card | `0,1,2,3,4,5` | 6 | 1 | enabled | 6 |
+| 8card | `0,1,2,3,4,5,6,7` | 8 | 1 | enabled | 8 |
+
+除设备列表和 `--data-parallel-size` 外，6 卡和 8 卡保持 4 卡模板的模型、服务名、TP、EP、端口、环境变量与编译模式不变。本轮统一参数仍需覆盖模板中的旧值：
+
+```text
+MAX_MODEL_LEN: 4096 → 32768
+新增: --max-num-seqs 256
+cudagraph_capture_sizes: [32,64,128,256]
+```
+
+模板中关于旧机器卡号/TSD 的注释不适用于当前新机器，不得据此删减设备。
 
 ### 7.4 所有服务脚本的统一约束
 
@@ -382,7 +412,7 @@ grep -RInE 'max-model-len|max-num-seqs|cudagraph_capture_sizes|enforce-eager|dat
 
 若出现 `--enforce-eager`、缺少 256、capture sizes 不完整或卡数不匹配，停止。
 
-## 8. Phase 2：生成每个测试点的 AisBench 配置
+## 8. 步骤三：生成每个测试点的 AisBench 配置
 
 ### 8.1 唯一正式命令形式
 
@@ -406,7 +436,7 @@ ais_bench "${BENCHMARK_CONFIG}" \
 
 ### 8.2 配置生成原则
 
-每个测试点从 Phase 0 找到的“已跑通 config”复制生成，不能从空文件猜 schema。
+每个测试点从步骤一找到的“已跑通 config”复制生成，不能从空文件猜 schema。
 
 例如：
 
@@ -420,7 +450,7 @@ perf_test/aisbench/datasets/afd_4a2f_bs128.*
 1. `batchsize=BS`
 2. dataset 请求数量设置为 `BS × 4`
 3. 服务地址指向当前服务端口
-4. model 名称保持 `DeepSeek-V4-Flash`
+4. model 名称与当前服务的 `--served-model-name` 完全一致；mix 使用 `deepseek-v4`，AFD 使用其实际服务名
 5. 复用同一个已确认的 32K workload 参数
 6. 复用相同采样参数和 summarizer
 
@@ -460,7 +490,7 @@ cudagraph_capture_sizes 包含 batchsize
 
 任何检查失败都禁止启动正式测试。
 
-## 9. Phase 3：自动化脚本契约
+## 9. 步骤四：生成自动化脚本并连续执行
 
 ### 9.1 run_one.sh
 
@@ -642,7 +672,7 @@ perf_test/summary/failures.csv
 
 发生失败后停止当前自动化，不修改源码，不向蓝区传文件。绿区 Agent 在当前对话中打印：
 
-1. phase、mode、topology、batchsize、dataset size
+1. 执行步骤、mode、topology、batchsize、dataset size
 2. 失败命令和退出码
 3. 本地结果目录
 4. 服务日志最后 200 行
@@ -664,11 +694,11 @@ tar -C /home/s00988495 \
 将本文件同步到绿区后，直接发送：
 
 ```text
-阅读 afd_deepseek_v4_perf_green_runbook.md，并严格按文档分阶段执行。
+阅读 afd_deepseek_v4_perf_green_runbook.md，并从头到尾自动执行，不要人为拆成阶段等待确认。
 
-先只执行 Phase 0：扫描当前 vLLM、vLLM-Ascend、afd-plugin、AisBench、已跑通的 AisBench config/dataset、当前可运行的 4A2F A/F 脚本及成功日志。生成 phase0_report.md 后停止，并在当前绿区对话中粘贴报告。不要在 Phase 0 直接生成拓扑或开始压测。
+先扫描当前 vLLM、vLLM-Ascend、afd-plugin、AisBench、已跑通的 AisBench config/dataset、当前可运行的 4A2F A/F 脚本及成功日志，把检查结果写入 environment_report.md。必要信息全部确认后立即继续生成脚本和执行测试，不要停下来等待用户或蓝区确认；只有缺少必要信息或实际报错时才停止。
 
-蓝区确认 Phase 0 后，再分析 4A2F 的 device、DP、EP、TP、A/F rank 和 connector 映射，并以它为基线生成 2A2F、6A2F 以及等卡 4/6/8card 普通混步脚本。
+分析 4A2F 的 device、DP、EP、TP、A/F rank 和 connector 映射，并以它为基线生成 2A2F 和 6A2F。普通混步使用用户提供的 4 卡脚本为唯一模板：4card 为 devices 0-3、DP4；6card 类推为 devices 0-5、DP6；8card 类推为 devices 0-7、DP8。三个混步脚本均保持 TP1、EP enabled、单服务，不添加任何 AFD connector 配置。
 
 本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4。正式命令只能使用 ais_bench CONFIG -m perf --num-warmups 1 -w WORK_DIR，不使用 --num-prompts，也不使用旧的 --models/--datasets/--mode perf 流程。
 
