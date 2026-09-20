@@ -129,15 +129,15 @@ if [[ "${1:-}" == "--inside-container" ]]; then
     echo
     echo "[INFO] Configuring git proxy..."
 
-    git config --global \
+    git config --global --replace-all \
         http.proxy \
         "http://p_atlas:proxy%40123@${ip_addr}:8080"
 
-    git config --global \
+    git config --global --replace-all \
         https.proxy \
         "http://p_atlas:proxy%40123@${ip_addr}:8080"
 
-    git config --global \
+    git config --global --replace-all \
         http.sslVerify \
         false
 
