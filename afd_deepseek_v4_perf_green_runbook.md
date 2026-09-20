@@ -59,7 +59,7 @@ WARMUPS=1
 它不等于：
 
 - `--max-num-batched-tokens`
-- `--num-prompts`
+- `--num-prompts`（该参数控制实际使用的数据条数，不控制并发）
 - A/F rank 数
 - DP 数量
 
@@ -67,6 +67,7 @@ WARMUPS=1
 
 ```text
 dataset_size = batchsize × 4
+--num-prompts = dataset_size
 ```
 
 | batchsize | dataset size |
@@ -108,7 +109,7 @@ ISL + OSL <= 32768
 - 不再测试 2K。
 - 不把并发固定为 128，而是扫描 32、64、128、256。
 - 不把请求数固定为 2048，而是严格使用 `4 × batchsize`。
-- 不使用 `--num-prompts` 控制正式测试数据量。
+- 使用 `--num-prompts $((batchsize * 4))` 控制每个正式测试点实际使用的数据条数。
 - 不使用 `ais_bench --models ... --datasets ... --mode perf`。
 - 不直接使用当前仓库中的 `aisbench_synthetic_gen.sh` 跑本轮实验；该脚本属于旧 CLI 流程。
 - 不额外手写一轮 warmup 请求；使用 AisBench 的 `--num-warmups 1`。
@@ -235,10 +236,32 @@ ais_bench -h 2>&1 | tee "${PERF_ROOT}/env/aisbench_help.txt"
 ais_bench CONFIG
 -m perf
 -w WORK_DIR
+--num-prompts NUM_PROMPTS
 --num-warmups 1
 ```
 
 若任一参数不受当前版本支持，停止并把完整 `ais_bench -h` 输出打印给用户，不要换回旧 CLI。
+
+当前环境已确认的关键帮助信息如下，后续命令以此为准：
+
+```text
+usage: ais_bench [options] [config]
+
+positional arguments:
+  config                 Benchmark config file path
+
+-m perf, --mode perf     使用性能测试模式
+-w WORK_DIR              指定独立结果目录
+--num-prompts N          实际推理和评测的 prompt 数量；N 必须 >= 1
+--num-warmups N          warmup 次数；默认 1，0 表示关闭
+```
+
+本实验显式传入：
+
+```text
+--num-prompts $((batchsize * 4))
+--num-warmups 1
+```
 
 ### 6.3 定位已有 AisBench 配置
 
@@ -300,7 +323,7 @@ find /home/s00988495 /root -type f \
 - AisBench 真实命令和版本
 - 已跑通 benchmark config 路径
 - `batchsize` 的配置位置
-- dataset 数量字段及配置路径
+- dataset 配置路径、可用数据总量及 `--num-prompts` 限制值
 - 32K workload 的 ISL/OSL
 - 当前 4A2F 两个脚本路径
 - 当前 4A2F 的设备、DP、TP、EP、A/F rank 和端口
@@ -421,6 +444,7 @@ grep -RInE 'max-model-len|max-num-seqs|cudagraph_capture_sizes|enforce-eager|dat
 ```bash
 ais_bench "${BENCHMARK_CONFIG}" \
     -m perf \
+    --num-prompts "${PROMPT_COUNT}" \
     --num-warmups 1 \
     -w "${WORK_DIR}"
 ```
@@ -431,7 +455,6 @@ ais_bench "${BENCHMARK_CONFIG}" \
 --models
 --datasets
 --mode perf
---num-prompts
 ```
 
 ### 8.2 配置生成原则
@@ -448,13 +471,13 @@ perf_test/aisbench/datasets/afd_4a2f_bs128.*
 每个点只按当前 config 的真实 schema 修改：
 
 1. `batchsize=BS`
-2. dataset 请求数量设置为 `BS × 4`
+2. 计算 `PROMPT_COUNT=BS × 4`，并确认当前 dataset 至少能提供这么多条数据
 3. 服务地址指向当前服务端口
 4. model 名称与当前服务的 `--served-model-name` 完全一致；mix 使用 `deepseek-v4`，AFD 使用其实际服务名
 5. 复用同一个已确认的 32K workload 参数
 6. 复用相同采样参数和 summarizer
 
-如果 config 中找不到明确的 `batchsize` 字段，停止并返回 config 内容；不要用 `batch_size`、`--num-prompts` 或其他字段替代。
+如果 config 中找不到明确的 `batchsize` 字段，停止并返回 config 内容；不要用 `batch_size` 或 `--num-prompts` 替代 batchsize。`--num-prompts` 只负责限制实际使用的数据条数。
 
 ### 8.3 生成后检查
 
@@ -465,6 +488,7 @@ mode
 topology
 batchsize
 dataset_size
+num_prompts
 benchmark_config
 dataset_config
 service endpoint
@@ -477,6 +501,7 @@ cudagraph_capture_sizes
 
 ```text
 dataset_size == batchsize × 4
+num_prompts == dataset_size
 batchsize <= 256
 batchsize ∈ [32,64,128,256]
 ```
@@ -504,17 +529,17 @@ bash run_one.sh mix 4card 128
 `run_one.sh` 必须按顺序完成：
 
 1. 校验 mode、topology、总卡数和 batchsize。
-2. 计算 `dataset_size=$((batchsize * 4))`。
+2. 计算 `dataset_size=$((batchsize * 4))` 和 `PROMPT_COUNT=$dataset_size`。
 3. 复制基线 AisBench config/dataset，生成当前测试点专用副本。
 4. 修改 config 中的 `batchsize`。
-5. 修改 dataset 配置中的请求数量。
+5. 确认 dataset 可用数据不少于 `PROMPT_COUNT`；正式命令传入 `--num-prompts "$PROMPT_COUNT"`。
 6. 校验 `max-num-seqs` 和 capture sizes。
 7. 创建独立的 log/result/work 目录。
 8. AFD 模式先启动 F，再启动 A；mix 模式启动单服务。
 9. 记录服务 PID，不使用宽范围 pkill。
 10. 轮询 `/v1/models`，等待服务 ready。
 11. 保存启动后的 `npu-smi info`。
-12. 执行一次 AisBench 正式命令，显式指定 `--num-warmups 1`。
+12. 执行一次 AisBench 正式命令，显式指定 `--num-prompts "$PROMPT_COUNT" --num-warmups 1`。
 13. 保存 AisBench stdout/stderr、work directory 和服务日志。
 14. 检查服务日志中的 graph capture 与 graph replay 状态。
 15. 停止本次记录的 PID，确认端口释放。
@@ -617,6 +642,7 @@ F cards
 total cards
 batchsize
 dataset size
+num-prompts
 max-model-len
 max-num-seqs
 cudagraph_capture_sizes
@@ -678,7 +704,7 @@ perf_test/summary/failures.csv
 4. 服务日志最后 200 行
 5. AisBench 日志最后 200 行
 6. 当前 PID、端口和 `npu-smi info`
-7. 生成的 benchmark config 与 dataset 数量字段片段
+7. 生成的 benchmark config、dataset 可用数据量以及实际 `--num-prompts` 值
 8. `status.txt` 内容
 
 可以在绿区本机生成压缩包供用户按允许的方式手动处理，但不得自动上传：
@@ -700,7 +726,7 @@ tar -C /home/s00988495 \
 
 分析 4A2F 的 device、DP、EP、TP、A/F rank 和 connector 映射，并以它为基线生成 2A2F 和 6A2F。普通混步使用用户提供的 4 卡脚本为唯一模板：4card 为 devices 0-3、DP4；6card 类推为 devices 0-5、DP6；8card 类推为 devices 0-7、DP8。三个混步脚本均保持 TP1、EP enabled、单服务，不添加任何 AFD connector 配置。
 
-本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4。正式命令只能使用 ais_bench CONFIG -m perf --num-warmups 1 -w WORK_DIR，不使用 --num-prompts，也不使用旧的 --models/--datasets/--mode perf 流程。
+本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4，并通过 --num-prompts 显式传入。正式命令使用 ais_bench CONFIG -m perf --num-prompts PROMPT_COUNT --num-warmups 1 -w WORK_DIR，不使用旧的 --models/--datasets/--mode perf 流程。
 
 先执行 2A2F+BS32 smoke test；产物完整时直接计入正式结果，不重复跑。随后严格按最小完成顺序执行：先跑完 2A2F 的 BS32/64/128/256，再跑 4card mix；然后跑 4A2F，再跑 6card mix；最后跑 6A2F，再跑 8card mix。完成一对等卡配置后再进入下一对。任何失败立即停止，在绿区保存原始文件，并在当前对话中打印错误摘要与日志尾部。不要修改源码，不要执行 git push、scp、curl 上传或其他跨区传输操作。
 ```
