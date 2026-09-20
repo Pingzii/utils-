@@ -54,7 +54,13 @@ WARMUPS=1
 
 ### 1.3 Batch Size 和数据量
 
-本实验的 Batch Size 只指 AisBench benchmark config 中的 `batchsize`。
+本实验的 Batch Size 只指下列 AisBench 全局 vLLM API model 配置中的 `batch_size`：
+
+```text
+/usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py
+```
+
+该 Python 配置不会与 AFD/mix 服务启动脚本自动同步。每个测试点开始前都必须重新读取、对照当前服务和 workload，必要时动态修改，并在修改后再次读取确认。
 
 它不等于：
 
@@ -289,14 +295,20 @@ find /home/s00988495 /root -type f \
 在候选文件中定位并记录：
 
 - benchmark config 入口
-- `batchsize` 字段
+- 全局 `vllm_api_stream_chat.py` 中的 `batch_size` 字段
 - model config 与服务地址
 - dataset config 与实际请求数量字段
 - 32K workload 的 ISL、OSL 和生成参数
 - summarizer config
 - 结果输出结构
 
-将已跑通的原始 config 和 dataset 原样复制到 `${PERF_ROOT}/aisbench/baseline/`。不要修改安装包内的唯一原件。
+将已跑通的 benchmark config、dataset 以及以下全局 model 配置原样复制到 `${PERF_ROOT}/aisbench/baseline/`：
+
+```text
+/usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py
+```
+
+全局 model 配置是 AisBench 实际读取的文件，因此每个测试点仍需修改它；但必须先保存基线备份，并在整轮测试结束或异常退出时恢复。不能只修改结果目录中的副本，因为副本不一定会被 AisBench 加载。
 
 ### 6.4 定位当前可运行的 4A2F 脚本和日志
 
@@ -322,7 +334,7 @@ find /home/s00988495 /root -type f \
 
 - AisBench 真实命令和版本
 - 已跑通 benchmark config 路径
-- `batchsize` 的配置位置
+- 全局 model 配置路径及其 `batch_size`、`host_port`、`path`、`model`、`max_out_len` 当前值
 - dataset 配置路径、可用数据总量及 `--num-prompts` 限制值
 - 32K workload 的 ISL/OSL
 - 当前 4A2F 两个脚本路径
@@ -457,7 +469,49 @@ ais_bench "${BENCHMARK_CONFIG}" \
 --mode perf
 ```
 
-### 8.2 配置生成原则
+### 8.2 全局 vLLM API model 配置是强制前置检查
+
+AisBench 实际使用的全局 Python 配置固定为：
+
+```bash
+MODEL_CONFIG="/usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py"
+```
+
+它不会自动跟随 AFD/mix 启动脚本变化。因此 `run_one.sh` 在**每次性能测试前**必须读取该文件，并把以下五项与当前测试点的预期值逐一对比：
+
+| 字段 | 必须匹配的值 |
+|---|---|
+| `host_port` | AFD 使用 Attention 对外 API 端口；mix 使用当前单服务端口 |
+| `path` | 当前 vLLM 服务实际加载的权重路径 |
+| `model` | 当前 vLLM 的 `--served-model-name`，必须完全一致 |
+| `max_out_len` | 当前 workload 的 OSL/最大输出长度，并满足 `ISL + max_out_len <= 32768` |
+| `batch_size` | 当前测试点的 BS：32、64、128 或 256 |
+
+基线示例中的值只是示例，不能对全部测试点写死：
+
+```python
+host_port=18000
+path="/mnt/weight/A5-weights/DeepSeek-V4-Flash"
+model="DeepSeek-V4-Flash"
+max_out_len=512
+batch_size=128
+```
+
+尤其要注意：AFD 和 mix 的 `path`、`model` 可能不同。当前已知 mix 基线使用 `/mnt/share/weight/DeepSeek-V4-Flash` 和 `deepseek-v4`；AFD 必须读取其实际启动脚本确定，不能沿用 mix 的值。
+
+处理规则：
+
+1. 五项全部一致：打印确认结果，不做无意义改写。
+2. 任一项不一致：只更新需要变化的字段，其他字段保持原样。
+3. 更新后重新读取并打印五项实际值，与预期值再次比较。
+4. Python 语法检查和五项二次确认全部通过，才允许调用 `ais_bench`。
+5. 任一字段无法唯一定位、出现重复定义或确认不一致：立即停止，不得带着旧配置开测。
+
+除这五项外，默认保留已跑通配置，包括 `type=VLLMCustomAPIChat`、`stream=True`、`request_rate=0`、`retry=2`、`temperature=0.01` 和 `ignore_eos=False`。除非现有可运行基线明确要求，否则不得顺手修改其他字段。
+
+每个测试点都要把修改后的全局 model 配置复制到该点结果目录，文件名为 `vllm_api_stream_chat.py`，用于复现和审计。
+
+### 8.3 benchmark config 与 dataset 生成原则
 
 每个测试点从步骤一找到的“已跑通 config”复制生成，不能从空文件猜 schema。
 
@@ -470,16 +524,15 @@ perf_test/aisbench/datasets/afd_4a2f_bs128.*
 
 每个点只按当前 config 的真实 schema 修改：
 
-1. `batchsize=BS`
+1. 在全局 model 配置中设置 `batch_size=BS`
 2. 计算 `PROMPT_COUNT=BS × 4`，并确认当前 dataset 至少能提供这么多条数据
-3. 服务地址指向当前服务端口
-4. model 名称与当前服务的 `--served-model-name` 完全一致；mix 使用 `deepseek-v4`，AFD 使用其实际服务名
-5. 复用同一个已确认的 32K workload 参数
-6. 复用相同采样参数和 summarizer
+3. 按 8.2 节同步全局 model 配置中的服务地址、权重路径、model 名称和 `max_out_len`
+4. 复用同一个已确认的 32K workload 参数
+5. 复用相同采样参数和 summarizer
 
-如果 config 中找不到明确的 `batchsize` 字段，停止并返回 config 内容；不要用 `batch_size` 或 `--num-prompts` 替代 batchsize。`--num-prompts` 只负责限制实际使用的数据条数。
+如果全局 model 配置中找不到唯一的 `batch_size` 字段，停止并返回文件内容。`--num-prompts` 只负责限制实际使用的数据条数，不能替代 `batch_size`。
 
-### 8.3 生成后检查
+### 8.4 生成后检查
 
 `run_one.sh` 必须在调用 AisBench 前输出并保存：
 
@@ -491,6 +544,12 @@ dataset_size
 num_prompts
 benchmark_config
 dataset_config
+model_config
+host_port
+path
+model
+max_out_len
+batch_size
 service endpoint
 max_model_len
 max_num_seqs
@@ -530,20 +589,23 @@ bash run_one.sh mix 4card 128
 
 1. 校验 mode、topology、总卡数和 batchsize。
 2. 计算 `dataset_size=$((batchsize * 4))` 和 `PROMPT_COUNT=$dataset_size`。
-3. 复制基线 AisBench config/dataset，生成当前测试点专用副本。
-4. 修改 config 中的 `batchsize`。
-5. 确认 dataset 可用数据不少于 `PROMPT_COUNT`；正式命令传入 `--num-prompts "$PROMPT_COUNT"`。
-6. 校验 `max-num-seqs` 和 capture sizes。
-7. 创建独立的 log/result/work 目录。
-8. AFD 模式先启动 F，再启动 A；mix 模式启动单服务。
-9. 记录服务 PID，不使用宽范围 pkill。
-10. 轮询 `/v1/models`，等待服务 ready。
-11. 保存启动后的 `npu-smi info`。
-12. 执行一次 AisBench 正式命令，显式指定 `--num-prompts "$PROMPT_COUNT" --num-warmups 1`。
-13. 保存 AisBench stdout/stderr、work directory 和服务日志。
-14. 检查服务日志中的 graph capture 与 graph replay 状态。
-15. 停止本次记录的 PID，确认端口释放。
-16. 写入当前测试点的 `manifest.txt` 和 `status.txt`。
+3. 复制基线 benchmark config/dataset，生成当前测试点专用副本。
+4. 创建独立的 log/result/work 目录。
+5. 读取当前服务脚本，确定预期的 API 端口、权重路径、served model name；从当前 32K workload 确定 `max_out_len`。
+6. 在调用 AisBench 前读取全局 `vllm_api_stream_chat.py`，逐项检查 `host_port`、`path`、`model`、`max_out_len`、`batch_size`。
+7. 如有不一致，只修改这五项中的差异项；随后重新读取并确认五项实际值与预期值完全一致。
+8. 将生效后的 `vllm_api_stream_chat.py` 复制到当前测试点结果目录。
+9. 确认 dataset 可用数据不少于 `PROMPT_COUNT`；正式命令传入 `--num-prompts "$PROMPT_COUNT"`。
+10. 校验 `max-num-seqs` 和 capture sizes。
+11. AFD 模式先启动 F，再启动 A；mix 模式启动单服务。
+12. 记录服务 PID，不使用宽范围 pkill。
+13. 轮询 `/v1/models`，等待服务 ready，并确认返回的 model 与全局配置中的 `model` 一致。
+14. 保存启动后的 `npu-smi info`。
+15. 再执行一次全局 model 配置五项终检，确认无其他进程改写后，执行一次 AisBench 正式命令，显式指定 `--num-prompts "$PROMPT_COUNT" --num-warmups 1`。
+16. 保存 AisBench stdout/stderr、work directory 和服务日志。
+17. 检查服务日志中的 graph capture 与 graph replay 状态。
+18. 停止本次记录的 PID，确认端口释放。
+19. 写入当前测试点的 `manifest.txt` 和 `status.txt`。
 
 结果目录名称：
 
@@ -558,6 +620,7 @@ results/RUN_ID/mix_8card_bs256/
 ```text
 benchmark_config.yaml
 dataset config/data
+vllm_api_stream_chat.py
 manifest.txt
 status.txt
 aisbench.log
@@ -643,6 +706,11 @@ total cards
 batchsize
 dataset size
 num-prompts
+model config path
+host port
+weight path
+served model name
+max-out-len
 max-model-len
 max-num-seqs
 cudagraph_capture_sizes
@@ -705,7 +773,8 @@ perf_test/summary/failures.csv
 5. AisBench 日志最后 200 行
 6. 当前 PID、端口和 `npu-smi info`
 7. 生成的 benchmark config、dataset 可用数据量以及实际 `--num-prompts` 值
-8. `status.txt` 内容
+8. 全局 `vllm_api_stream_chat.py` 的备份路径、当前快照及五项终检结果
+9. `status.txt` 内容
 
 可以在绿区本机生成压缩包供用户按允许的方式手动处理，但不得自动上传：
 
@@ -726,7 +795,7 @@ tar -C /home/s00988495 \
 
 分析 4A2F 的 device、DP、EP、TP、A/F rank 和 connector 映射，并以它为基线生成 2A2F 和 6A2F。普通混步使用用户提供的 4 卡脚本为唯一模板：4card 为 devices 0-3、DP4；6card 类推为 devices 0-5、DP6；8card 类推为 devices 0-7、DP8。三个混步脚本均保持 TP1、EP enabled、单服务，不添加任何 AFD connector 配置。
 
-本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。Batch Size 只使用 AisBench config 中的 batchsize；dataset size 永远等于 batchsize×4，并通过 --num-prompts 显式传入。正式命令使用 ais_bench CONFIG -m perf --num-prompts PROMPT_COUNT --num-warmups 1 -w WORK_DIR，不使用旧的 --models/--datasets/--mode perf 流程。
+本轮固定 max-model-len=32768、max-num-seqs=256、cudagraph_capture_sizes=[32,64,128,256]，禁止 enforce-eager。AisBench 的全局 model 配置固定为 /usr/local/python3.11.10/lib/python3.11/site-packages/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py。这个文件不会与 AFD/mix 启动脚本自动同步；每个测试点调用 AisBench 前，必须读取并核对 host_port、path、model、max_out_len、batch_size，需要时动态修改，修改后再次读取确认。AFD 的 host_port 指向 Attention API 端口，path/model 必须匹配当前 vLLM 启动参数，batch_size 等于当前 BS，max_out_len 匹配当前 workload。先备份原文件，每个结果目录保存一份生效快照，整轮结束或异常退出时恢复原文件。dataset size 永远等于 batch_size×4，并通过 --num-prompts 显式传入。正式命令使用 ais_bench CONFIG -m perf --num-prompts PROMPT_COUNT --num-warmups 1 -w WORK_DIR，不使用旧的 --models/--datasets/--mode perf 流程。
 
 先执行 2A2F+BS32 smoke test；产物完整时直接计入正式结果，不重复跑。随后严格按最小完成顺序执行：先跑完 2A2F 的 BS32/64/128/256，再跑 4card mix；然后跑 4A2F，再跑 6card mix；最后跑 6A2F，再跑 8card mix。完成一对等卡配置后再进入下一对。任何失败立即停止，在绿区保存原始文件，并在当前对话中打印错误摘要与日志尾部。不要修改源码，不要执行 git push、scp、curl 上传或其他跨区传输操作。
 ```
